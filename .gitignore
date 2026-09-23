@@ -32,3 +32,6 @@ keys/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Internal working notes and analysis: kept locally, never published
+docs/
