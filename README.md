@@ -16,8 +16,9 @@ Ships as a single executable — Windows x64 (`ieee-mcp.exe`) or Linux amd64
 
 ## Install
 
-**Prebuilt** — take the binary for your platform and put it anywhere. Paths with
-spaces or non-ASCII characters are fine.
+**Prebuilt** — take the binary for your platform from the
+[latest release](https://github.com/Saknutella/ieee-mcp-revamp/releases/latest) and put
+it anywhere. Paths with spaces or non-ASCII characters are fine.
 
 | Platform | File |
 |---|---|
