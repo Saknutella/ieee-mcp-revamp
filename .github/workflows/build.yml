@@ -53,14 +53,8 @@ jobs:
       - name: Test (${{ matrix.target }})
         run: node test/run-all.mjs
 
-      - name: Report build info
-        shell: bash
-        run: |
-          echo "### ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat dist/BUILD-INFO.json >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat build/test-results.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Summarise build and test results
+        run: node scripts/ci-summary.mjs
 
       - name: Upload executable and checksums
         uses: actions/upload-artifact@v4
