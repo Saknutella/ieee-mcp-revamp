@@ -10,6 +10,8 @@ name: build
 on:
   push:
     branches: [master]
+    # A version tag builds and tests both platforms, then publishes them.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -66,3 +68,40 @@ jobs:
             dist/SHA256SUMS.txt
             dist/BUILD-INFO.json
             build/test-results.json
+
+  # Publishing happens only for a version tag, and only after every platform
+  # build above has passed its test suite. There is deliberately no other route
+  # to a release: the Linux executable cannot be run anywhere but Linux, so an
+  # untested one must not be able to reach users.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Re-verifies each binary against the hash its own build recorded, and
+      # refuses a tag that disagrees with the version in package.json.
+      - name: Assemble release assets
+        run: node scripts/release-assets.mjs artifacts release
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file release/NOTES.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release/NOTES.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            release/ieee-mcp.exe \
+            release/ieee-mcp-linux-amd64 \
+            release/SHA256SUMS.txt
