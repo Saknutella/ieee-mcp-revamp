@@ -39,7 +39,10 @@ export class ResultStore {
     if (this.config.resultTtlSeconds <= 0) return;
     try {
       ensureDir(this.config.resultsDir);
-      atomicWriteFileSync(this.fileFor(payload.search_id), `${JSON.stringify(payload)}\n`);
+      // `stored_at_ms` is what `load` uses to enforce the TTL, so it must be
+      // written alongside the payload rather than inferred from file mtime.
+      const stamped = { ...payload, stored_at_ms: Date.now() };
+      atomicWriteFileSync(this.fileFor(payload.search_id), `${JSON.stringify(stamped)}\n`);
       this.prune();
     } catch (error) {
       log.warn(`Could not persist result set ${payload.search_id}: ${String(error)}`);

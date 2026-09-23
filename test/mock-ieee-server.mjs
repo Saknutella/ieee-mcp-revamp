@@ -81,6 +81,12 @@ function makeArticle(index) {
 
 export const CATALOGUE = Array.from({ length: CATALOGUE_SIZE }, (_, i) => makeArticle(i + 1));
 
+/** DOI the catalogue assigns to a given article number, for use in test fixtures. */
+export function doiForArticleNumber(articleNumber) {
+  const article = CATALOGUE.find((entry) => entry.article_number === String(articleNumber));
+  return article?.doi ?? null;
+}
+
 export function createMockState(overrides = {}) {
   return {
     /** Number reported in `total_records`. */
@@ -117,14 +123,22 @@ function selectArticles(state, params) {
   const maxRecords = Number(params.get("max_records") ?? "25") || 25;
 
   // Documented identifier lookup: article_number wins, then doi.
+  // IEEE documents both as usable *only by themselves*. Verified against the
+  // live API: adding `max_records` makes IEEE answer `total_records: 1` while
+  // omitting the `articles` array entirely. The mock reproduces that exactly so
+  // a regression that re-adds paging parameters fails the suite.
   const articleNumber = params.get("article_number");
-  if (articleNumber) {
-    const found = CATALOGUE.filter((article) => article.article_number === articleNumber);
-    return { total: found.length, articles: found.slice(0, maxRecords) };
-  }
   const doi = params.get("doi");
-  if (doi) {
-    const found = CATALOGUE.filter((article) => article.doi === doi);
+  if (articleNumber || doi) {
+    const found = articleNumber
+      ? CATALOGUE.filter((article) => article.article_number === articleNumber)
+      : CATALOGUE.filter((article) => article.doi === doi);
+    const extras = [...params.keys()].filter(
+      (key) => !["article_number", "doi", "apikey"].includes(key)
+    );
+    if (extras.length > 0) {
+      return { total: found.length, articles: [], identifierQuirk: extras };
+    }
     return { total: found.length, articles: found.slice(0, maxRecords) };
   }
 

@@ -13,11 +13,13 @@ import {
   describeTarget,
   freshDir,
   mcpBatch,
+  paramKeys,
+  requestWith,
   session,
   toolCall,
   toolJson,
 } from "./harness.mjs";
-import { startMockServer } from "./mock-ieee-server.mjs";
+import { startMockServer, doiForArticleNumber } from "./mock-ieee-server.mjs";
 
 const API_KEY = "0123456789abcdef0123456789abcdef";
 
@@ -298,14 +300,14 @@ export async function run() {
           sort_order: "asc",
           max_records: 5,
         }),
-        toolCall(3, "search_papers", { doi: "10.1109/TEST.2024.1001", querytext: "should be ignored" }),
+        toolCall(3, "search_papers", { doi: doiForArticleNumber(1000002) ?? "unknown", querytext: "should be ignored" }),
         toolCall(4, "search_papers", { content_type: "conference" }),
         toolCall(5, "search_papers", { sort_field: "publication_year" }),
         toolCall(6, "search_papers", { querytext: "x", author: "Zh*" }),
       ]),
     });
 
-    const paramRequest = mock.state.requests[0];
+    const paramRequest = requestWith(mock, "content_type");
     reporter.equal("content_type is sent verbatim", paramRequest?.params?.content_type, "Conferences");
     reporter.equal("open_access uses IEEE's documented casing", paramRequest?.params?.open_access, "True");
     reporter.equal("start_year is forwarded", paramRequest?.params?.start_year, "2020");
@@ -322,13 +324,18 @@ export async function run() {
     reporter.check("a User-Agent was sent", typeof paramRequest?.userAgent === "string" && paramRequest.userAgent.includes("ieee-mcp"));
 
     const doiPayload = toolJson(byId(paramRun.responses, 3));
-    const doiRequest = mock.state.requests[1];
+    const doiRequest = requestWith(mock, "doi");
     reporter.equal(
-      "doi lookup sends only doi",
+      "doi lookup sends doi and nothing else",
       Object.keys(doiRequest?.params ?? {})
-        .filter((key) => !["max_records", "start_record", "apikey"].includes(key))
+        .filter((key) => key !== "apikey")
         .join(","),
       "doi"
+    );
+    reporter.check(
+      "identifier lookups never send max_records (IEEE would drop the record body)",
+      doiRequest?.params?.max_records === undefined && doiRequest?.params?.start_record === undefined,
+      JSON.stringify(doiRequest?.params)
     );
     reporter.check(
       "doi exclusivity is explained",
@@ -347,6 +354,112 @@ export async function run() {
       byId(paramRun.responses, 6)?.result?.isError === true,
       JSON.stringify(byId(paramRun.responses, 6)?.result).slice(0, 300)
     );
+
+    // ── identifier lookup quirks ─────────────────────────────────────────────
+    reporter.section("identifier lookup");
+    mock.state.requests.length = 0;
+    const doiValue = doiForArticleNumber(1000002);
+    const lookupRun = await mcpBatch(target, {
+      label: "search-identifier",
+      env: baseEnv(mock, freshDir("search-identifier")),
+      requests: session([
+        toolCall(2, "search_papers", { article_number: "1000002" }),
+        toolCall(3, "search_papers", { doi: doiValue }),
+        toolCall(4, "search_papers", { article_number: "9999999" }),
+      ]),
+    });
+    const byArticleNumber = toolJson(byId(lookupRun.responses, 2));
+    reporter.equal("article_number lookup returns the record", byArticleNumber?.returned_records, 1);
+    reporter.equal("article_number lookup finds the right record", byArticleNumber?.articles?.[0]?.article_number, "1000002");
+    reporter.equal("article_number lookup reports has_more false", byArticleNumber?.pagination?.has_more, false);
+    reporter.equal(
+      "article_number lookup explains why paging is not applicable",
+      byArticleNumber?.pagination?.stop_reason,
+      "identifier lookup returns at most one record"
+    );
+    reporter.equal(
+      "article_number request carries only article_number",
+      paramKeys(requestWith(mock, "article_number")),
+      "article_number"
+    );
+
+    const byDoi = toolJson(byId(lookupRun.responses, 3));
+    reporter.equal("doi lookup returns the record", byDoi?.returned_records, 1);
+    reporter.equal("doi lookup finds the right record", byDoi?.articles?.[0]?.doi, doiValue);
+    reporter.equal("doi request carries only doi", paramKeys(requestWith(mock, (r) => r.params.doi === doiValue)), "doi");
+
+    const unknown = toolJson(byId(lookupRun.responses, 4));
+    reporter.check("an unknown identifier is not an error", unknown !== null && byId(lookupRun.responses, 4)?.result?.isError !== true);
+    reporter.equal("an unknown identifier returns no records", unknown?.returned_records, 0);
+    reporter.equal("an unknown identifier reports zero totals", unknown?.total_records, 0);
+
+    // ── convenience wrappers and status actions ──────────────────────────────
+    reporter.section("convenience tools and status actions");
+    mock.state.requests.length = 0;
+    const convenienceDir = freshDir("search-convenience");
+    const convenienceEnv = baseEnv(mock, convenienceDir);
+    const searchPhase = await mcpBatch(target, {
+      label: "search-convenience-searches",
+      env: convenienceEnv,
+      requests: session([
+        toolCall(2, "search_by_author", { author: "Alice Zhang", max_records: 3, start_year: "2020" }),
+        toolCall(3, "search_by_publication", {
+          publication_title: "IEEE Transactions on Antennas and Propagation",
+          querytext: "array",
+          max_records: 3,
+        }),
+        toolCall(4, "search_by_publication", {
+          publication_title: "X",
+          max_records: 3,
+          sort_field: "publication_year",
+        }),
+      ]),
+    });
+
+    const byAuthor = toolJson(byId(searchPhase.responses, 2));
+    reporter.check("search_by_author succeeds", byAuthor !== null && byAuthor.returned_records > 0, byId(searchPhase.responses, 2)?.result?.content?.[0]?.text?.slice(0, 200));
+    reporter.equal("search_by_author sends the author filter", requestWith(mock, "author")?.params?.author, "Alice Zhang");
+    reporter.equal("search_by_author sends the year range", requestWith(mock, "author")?.params?.start_year, "2020");
+    reporter.equal("search_by_author records its own retrieved_via", byAuthor?.articles?.[0]?.retrieved_via, "search_by_author");
+
+    const byPublication = toolJson(byId(searchPhase.responses, 3));
+    reporter.check("search_by_publication succeeds", byPublication !== null && byPublication.returned_records > 0);
+    reporter.equal(
+      "search_by_publication sends the publication filter",
+      requestWith(mock, "publication_title")?.params?.publication_title,
+      "IEEE Transactions on Antennas and Propagation"
+    );
+    reporter.equal("search_by_publication forwards querytext", requestWith(mock, "publication_title")?.params?.querytext, "array");
+    reporter.check(
+      "search_by_publication rejects the undocumented sort_field",
+      byId(searchPhase.responses, 4)?.result?.isError === true,
+      JSON.stringify(byId(searchPhase.responses, 4)?.result).slice(0, 200)
+    );
+
+    // A second process, so the file-backed cache and ledger are already settled.
+    const statusPhase = await mcpBatch(target, {
+      label: "search-convenience-status",
+      env: convenienceEnv,
+      requests: session([
+        toolCall(2, "ieee_status", {}),
+        toolCall(3, "ieee_status", { clear_cache: true, reset_local_usage: true }),
+        toolCall(4, "ieee_status", {}),
+      ]),
+    });
+
+    const statusBefore = toolJson(byId(statusPhase.responses, 2));
+    reporter.check("status reports cached entries before clearing", (statusBefore?.cache?.entries ?? 0) > 0, JSON.stringify(statusBefore?.cache));
+    reporter.check(
+      "status reports the persisted local call count",
+      (statusBefore?.local_usage?.local_calls_utc_day ?? 0) > 0,
+      JSON.stringify(statusBefore?.local_usage)
+    );
+    const statusAfter = toolJson(byId(statusPhase.responses, 3));
+    reporter.check("clear_cache reports how many entries were removed", (statusAfter?.cache?.cleared_entries ?? 0) > 0, JSON.stringify(statusAfter?.cache));
+    reporter.equal("cache is empty after clearing", statusAfter?.cache?.entries, 0);
+    reporter.equal("reset_local_usage zeroes the local counter", statusAfter?.local_usage?.local_calls_utc_day, 0);
+    const statusLater = toolJson(byId(statusPhase.responses, 4));
+    reporter.equal("the reset persisted across calls", statusLater?.local_usage?.local_calls_utc_day, 0);
   } finally {
     await mock.close();
   }

@@ -10,7 +10,7 @@
  * article bodies, and this server never describes it as one.
  */
 
-import { InputError, toIeeeMcpError } from "./errors.js";
+import { InputError } from "./errors.js";
 import { log } from "./logger.js";
 import { processCounters } from "./budget.js";
 import type { Config } from "./config.js";
@@ -270,9 +270,35 @@ async function runJob(
     maxRequestsForThisJob: number;
     noCache: boolean;
     via: string;
+    identifierLookup: boolean;
   }
 ): Promise<JobResult> {
   const { client } = context;
+
+  // IEEE documents `article_number` (and `doi`) as usable *only by themselves*.
+  // Verified against the live API: adding `max_records` makes IEEE answer
+  // `total_records: 1` with no `articles` array at all. So send the identifier
+  // alone and never paginate.
+  if (options.identifierLookup) {
+    const result = await client.search({ ...spec.params }, { via: options.via, noCache: options.noCache });
+    const payload = result.payload as IEEESearchResponse;
+    const pageArticles = Array.isArray(payload.articles) ? payload.articles : [];
+    return {
+      label: spec.label,
+      params: spec.params,
+      total_records: readTotalRecords(payload),
+      articles: pageArticles,
+      requests: 1,
+      cache_hits: result.fromCache ? 1 : 0,
+      pages: 1,
+      has_more: false,
+      next_start_record: null,
+      stop_reason: "identifier lookup returns at most one record",
+      from_cache: result.fromCache,
+      retrieved_at: result.retrievedAt,
+    };
+  }
+
   const articles: IEEEArticle[] = [];
   let requests = 0;
   let cacheHits = 0;
@@ -423,6 +449,7 @@ export async function executeSearch(context: SearchContext, args: SearchArgs, vi
       maxRequestsForThisJob: budgetForJob,
       noCache: args.no_cache === true,
       via,
+      identifierLookup: base.identifierLookup,
     });
     budgetForJob -= job.requests;
     jobResults.push(job);
@@ -462,6 +489,13 @@ export async function executeSearch(context: SearchContext, args: SearchArgs, vi
     warnings.push(
       "Multi-query (merged) result: total_records is not meaningful for a union of queries, so it is null. " +
         "See per_query for each query's own totals and paging state."
+    );
+  }
+  if (base.identifierLookup && capped.length === 0 && (totalRecords ?? 0) > 0) {
+    warnings.push(
+      "IEEE reported a matching record for this identifier but returned no record body. " +
+        "This happens for a small number of documents that are indexed for search but not " +
+        "retrievable through the Metadata Search API."
     );
   }
   if (singleJob && hasMore && nextStart !== null) {
@@ -545,8 +579,7 @@ export interface LookupOutcome {
   raw: unknown;
 }
 
-/** Shared implementation for identifier lookups (`article_number` / `doi`). */
-export async function executeIdentifierLookup(
+/** Shared implementation for identifier lookups (`article_number` / `doi`). */export async function executeIdentifierLookup(
   context: SearchContext,
   args: { article_number?: string; doi?: string },
   via: string
@@ -564,9 +597,4 @@ export async function executeIdentifierLookup(
   else searchArgs.doi = doi;
 
   return executeSearch(context, searchArgs, via);
-}
-
-export function summarizeError(error: unknown): { thrown: unknown; code: string } {
-  const normalized = toIeeeMcpError(error);
-  return { thrown: normalized, code: normalized.code };
 }

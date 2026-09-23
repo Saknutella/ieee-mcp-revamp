@@ -16,12 +16,14 @@ import process from "node:process";
 
 import { describeTarget, REPO_ROOT } from "./harness.mjs";
 import { run as protocol } from "./e2e-protocol.mjs";
+import { run as cli } from "./e2e-cli.mjs";
 import { run as search } from "./e2e-search.mjs";
 import { run as resilience } from "./e2e-resilience.mjs";
 import { run as exportSuite } from "./e2e-export.mjs";
 
 const suites = [
   ["protocol", protocol],
+  ["cli", cli],
   ["search", search],
   ["resilience", resilience],
   ["export", exportSuite],

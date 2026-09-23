@@ -43,7 +43,11 @@ export function mcpBatch(target, options) {
   const inFile = path.join(dir, "stdin.jsonl");
   const outFile = path.join(dir, "stdout.jsonl");
   const errFile = path.join(dir, "stderr.log");
-  fs.writeFileSync(inFile, `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`, "utf8");
+  fs.writeFileSync(
+    inFile,
+    requests.length === 0 ? "" : `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
+    "utf8"
+  );
   fs.writeFileSync(outFile, "", "utf8");
   fs.writeFileSync(errFile, "", "utf8");
 
@@ -111,8 +115,76 @@ export function mcpBatch(target, options) {
   });
 }
 
-export function initialize(id = 1) {
-  return {
+/**
+ * Run the executable as a plain CLI (no MCP conversation) and capture its
+ * streams. Uses the same file-descriptor stdio as `mcpBatch`.
+ */
+export function runCli(target, args, options = {}) {
+  const { env = {}, cwd, timeoutMs = 60_000, label = "cli", stdin = "" } = options;
+  const command = typeof target === "string" ? target : target.command;
+  const baseArgs = typeof target === "string" ? [] : target.args ?? [];
+  const dir = freshDir(label);
+
+  const inFile = path.join(dir, "stdin.txt");
+  const outFile = path.join(dir, "stdout.txt");
+  const errFile = path.join(dir, "stderr.log");
+  fs.writeFileSync(inFile, stdin, "utf8");
+  const inFd = fs.openSync(inFile, "r");
+  const outFd = fs.openSync(outFile, "w");
+  const errFd = fs.openSync(errFile, "w");
+
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(command, [...baseArgs, ...args], {
+        cwd: cwd ?? dir,
+        env: { ...process.env, ...env },
+        stdio: [inFd, outFd, errFd],
+        windowsHide: true,
+      });
+    } catch (error) {
+      fs.closeSync(inFd);
+      fs.closeSync(outFd);
+      fs.closeSync(errFd);
+      reject(error);
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* ignore */
+      }
+    }, timeoutMs);
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      for (const fd of [inFd, outFd, errFd]) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+      }
+      resolve({
+        code,
+        stdout: fs.readFileSync(outFile, "utf8"),
+        stderr: fs.readFileSync(errFile, "utf8"),
+        dir,
+      });
+    });
+  });
+}
+
+export function initialize(id = 1) {  return {
     jsonrpc: "2.0",
     id,
     method: "initialize",
@@ -144,6 +216,25 @@ export function session(extra, startId = 2) {
 
 export function byId(responses, id) {
   return responses.find((response) => response.id === id);
+}
+
+/**
+ * Find a request the mock captured by a parameter it carried.
+ * Requests are matched by content rather than arrival order, because an MCP
+ * client may issue several tool calls at once and the server answers them
+ * concurrently.
+ */
+export function requestWith(mock, predicate) {
+  return mock.state.requests.find((request) =>
+    typeof predicate === "function" ? predicate(request) : Boolean(request.params?.[predicate])
+  );
+}
+
+export function paramKeys(request, { includeApiKey = false } = {}) {
+  return Object.keys(request?.params ?? {})
+    .filter((key) => includeApiKey || key !== "apikey")
+    .sort()
+    .join(",");
 }
 
 /**

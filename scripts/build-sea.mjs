@@ -154,28 +154,34 @@ export function smokeTest() {
   return JSON.parse(stderr.slice(stderr.indexOf("{")));
 }
 
-export async function buildSea() {
+export async function buildSea(options = {}) {
   if (!fs.existsSync(BUNDLE_FILE)) {
     throw new Error(`Missing ${BUNDLE_FILE}. Run scripts/bundle.mjs first.`);
   }
+  // `useCodeCache: true` embeds a V8 code cache, which makes the blob - and
+  // therefore the executable - differ between otherwise identical builds.
+  // Measured startup is the same either way (~73 ms), so the code cache is off
+  // by default and the executable is byte-reproducible. Set
+  // IEEE_BUILD_CODE_CACHE=1 to opt into it.
+  const codeCacheRequested = options.useCodeCache ?? process.env.IEEE_BUILD_CODE_CACHE === "1";
   let blobSize;
-  let useCodeCache = true;
+  let useCodeCache = codeCacheRequested;
   try {
     blobSize = buildBlob(useCodeCache);
   } catch (error) {
-    process.stdout.write(`    code cache build failed (${error.message}); retrying without it\n`);
+    process.stdout.write(`    SEA blob build failed (${error.message}); retrying without a code cache\n`);
     useCodeCache = false;
     blobSize = buildBlob(useCodeCache);
   }
   const exeSize = await injectBlob();
   const report = smokeTest();
-  return { blobSize, exeSize, useCodeCache, report };
+  return { blobSize, exeSize, useCodeCache, reproducible: !useCodeCache, report };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const result = await buildSea();
   process.stdout.write(
     `\nSEA executable: ${EXE_FILE}\n  blob ${result.blobSize} bytes, exe ${result.exeSize} bytes, ` +
-      `useCodeCache=${result.useCodeCache}\n`
+      `useCodeCache=${result.useCodeCache}, reproducible=${result.reproducible}\n`
   );
 }

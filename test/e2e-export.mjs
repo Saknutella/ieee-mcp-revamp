@@ -13,12 +13,14 @@ import {
   describeTarget,
   freshDir,
   mcpBatch,
+  paramKeys,
   REPO_ROOT,
+  requestWith,
   session,
   toolCall,
   toolJson,
 } from "./harness.mjs";
-import { startMockServer } from "./mock-ieee-server.mjs";
+import { startMockServer, doiForArticleNumber } from "./mock-ieee-server.mjs";
 
 const API_KEY = "0123456789abcdef0123456789abcdef";
 
@@ -173,12 +175,13 @@ export async function run() {
     // ── identifier lookup ────────────────────────────────────────────────────
     reporter.section("identifier lookups");
     mock.state.requests.length = 0;
+    const detailDoi = doiForArticleNumber(1000001);
     const lookupRun = await mcpBatch(target, {
       label: "lookups",
       env: baseEnv(mock, freshDir("export-lookup")),
       requests: session([
         toolCall(2, "get_paper_details", { article_number: "1000001" }),
-        toolCall(3, "get_paper_details", { doi: "10.1109/TEST.2024.1001" }),
+        toolCall(3, "get_paper_details", { doi: detailDoi }),
         toolCall(4, "get_paper_details", {}),
         toolCall(5, "get_paper_citations", { article_number: "1000003" }),
       ]),
@@ -188,12 +191,21 @@ export async function run() {
     reporter.equal("article_number matches", details?.articles?.[0]?.article_number, "1000001");
     reporter.check("details include affiliations", Boolean(details?.articles?.[0]?.authors?.[0]?.affiliation));
     reporter.check("details include abstract", typeof details?.articles?.[0]?.abstract === "string");
-    const queryParamsOf = (request) =>
-      Object.keys(request?.params ?? {})
-        .filter((key) => !["max_records", "start_record", "apikey"].includes(key))
-        .join(",");
-    reporter.equal("article_number lookup sends only article_number", queryParamsOf(mock.state.requests[0]), "article_number");
-    reporter.equal("doi lookup sends only doi", queryParamsOf(mock.state.requests[1]), "doi");
+    const byDoiLookup = toolJson(byId(lookupRun.responses, 3));
+    reporter.equal("doi lookup returns one record", byDoiLookup?.returned_records, 1);
+    reporter.equal("doi lookup matches", byDoiLookup?.articles?.[0]?.doi, detailDoi);
+    // Strict: an identifier may be sent with NO other parameter, because IEEE
+    // silently drops the record body when any extra parameter accompanies it.
+    reporter.equal(
+      "article_number lookup sends article_number and nothing else",
+      paramKeys(requestWith(mock, "article_number")),
+      "article_number"
+    );
+    reporter.equal(
+      "doi lookup sends doi and nothing else",
+      paramKeys(requestWith(mock, (request) => request.params.doi === detailDoi)),
+      "doi"
+    );
     const noArgs = JSON.parse(byId(lookupRun.responses, 4)?.result?.content?.[0]?.text ?? "{}");
     reporter.check("missing identifier is rejected", byId(lookupRun.responses, 4)?.result?.isError === true);
     reporter.equal("missing identifier error code", noArgs.code, "INPUT_ERROR");

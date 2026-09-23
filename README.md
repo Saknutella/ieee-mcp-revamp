@@ -37,7 +37,7 @@ IEEE Xplore Metadata Search API 的 `querytext` / `meta_data` 官方定义是
 | Windows x64 单文件可执行程序 | `dist/ieee-mcp.exe` |
 | 校验和 | `dist/SHA256SUMS.txt`（`sha256sum` 格式） |
 | 构建环境与产物清单 | `dist/BUILD-INFO.json` |
-| 自动化测试（223 项） | `test/`（`node test/run-all.mjs`） |
+| 自动化测试（277 项） | `test/`（`node test/run-all.mjs`） |
 | 测试报告 | `docs/测试报告.md` |
 | IEEE 官方参数核对 | `docs/IEEE-API-参数核对.md` |
 | 上游源码审计 | `docs/上游源码审计.md` |
@@ -50,9 +50,19 @@ Get-FileHash .\dist\ieee-mcp.exe -Algorithm SHA256
 Get-Content .\dist\SHA256SUMS.txt
 ```
 
-> `dist/ieee-mcp.exe` 体积约 87 MB，因为它**内含 Node.js 运行时**。它已加入
-> `.gitignore`（避免把 87 MB 二进制写进 Git 历史）；仓库中保留可复现构建脚本与校验和，
-> 随时可用一条命令重建。
+当前产物：
+
+| 文件 | 字节 | SHA-256 |
+|---|---|---|
+| `dist/ieee-mcp.exe` | 90,894,848 | `9b7f48368cc30602f4669b341fd9a436001c95f64b559b18881beeb65ce32d3d` |
+| `build/bundle.cjs` | 832,503 | `1ff1b05a9fa3b3ca0d2817e4187e7214f717e73b3cb52c6d2a6ed7504aac29b4` |
+| `build/ieee-mcp.blob` | 832,544 | `4ebef8e557376e73d3b574a1de841ab700f05216967e81aaa41ac0f40f52e872` |
+
+构建是**字节级可复现**的（详见下文"可复现构建"），因此这些校验和可用于验证源码与二进制的对应关系。
+
+> `dist/ieee-mcp.exe` 体积约 87 MiB，因为它**内含 Node.js 运行时**。它已加入
+> `.gitignore`（避免把 87 MiB 二进制写进 Git 历史）；仓库中保留可复现构建脚本与校验和，
+> 随时可用一条命令重建出**字节相同**的产物。
 
 ---
 
@@ -498,9 +508,21 @@ node scripts/checksums.mjs      # dist/SHA256SUMS.txt + dist/BUILD-INFO.json
 3. **去签名**：注入前移除 `node.exe` 的 Authenticode 证书表（PE 目录项 4），否则被改写过的
    签名镜像在部分 Windows 策略下会被拒绝加载。该步骤是纯 JS 实现的 PE 解析，
    **不依赖 Windows SDK 的 `signtool`**。
-4. **`useCodeCache`**：默认开启（冷启动实测约 80 ms）；若某 Node 版本下生成失败，
-   构建脚本自动回退为关闭并继续。
-5. **离线**：`npm install` 之后整个构建过程不需要网络。
+4. **离线**：`npm install` 之后整个构建过程不需要网络。
+
+### 可复现性
+
+**默认构建是字节级可复现的**：连续两次 `node scripts/build.mjs` 会产生完全相同的
+SHA-256（`bundle.cjs`、`ieee-mcp.blob`、`ieee-mcp.exe` 三者一致），因此
+`dist/SHA256SUMS.txt` 可以被用来验证"这份源码确实能构建出这份二进制"。
+
+字节级可复现的原因是 SEA 配置中 **关闭了 V8 code cache**（`useCodeCache: false`）。
+开启它会嵌入一段非确定性的 V8 代码缓存；实测两者冷启动耗时相同（约 73 ms，5 次平均），
+所以默认关闭，不牺牲性能。如需尝试：
+
+```powershell
+$env:IEEE_BUILD_CODE_CACHE="1"; node scripts/build.mjs   # 开启 code cache，构建不再字节可复现
+```
 
 > 构建脚本用 `node scripts/build.mjs` 直接运行而非 `npm run`，是为了在受限环境
 > （例如禁止子进程管道的沙箱）下也能构建：esbuild 走 CLI（stdio 直通），
@@ -511,7 +533,7 @@ node scripts/checksums.mjs      # dist/SHA256SUMS.txt + dist/BUILD-INFO.json
 ## 测试
 
 ```powershell
-node test/run-all.mjs                       # 默认测 dist/ieee-mcp.exe（223 项）
+node test/run-all.mjs                       # 默认测 dist/ieee-mcp.exe（277 项）
 node test/run-all.mjs search export         # 只跑指定套件
 $env:IEEE_TEST_TARGET="bundle"; node test/run-all.mjs   # 测未打包 bundle，迭代更快
 ```
@@ -522,11 +544,12 @@ $env:IEEE_TEST_TARGET="bundle"; node test/run-all.mjs   # 测未打包 bundle，
 | 套件 | 项数 | 覆盖内容 |
 |---|---|---|
 | `protocol` | 30 | `initialize`、`tools/list`、stdout 纯净性、stdout/stderr 分离、无密钥降级、`get_full_text` 已移除、未知工具错误 |
-| `search` | 77 | **分页边界 26/25**、翻页衔接、字段完整性、`missing_fields`、缓存命中/过期/持久化/关闭、并发合并、多查询合并去重、`auto_paginate` 上限、`max_requests`、参数大小写与 `%20` 编码、`doi`/`article_number` 排他性、非法 `content_type`/`sort_field`/通配符拒绝 |
+| `cli` | 26 | `--version`/`--help`/`--self-test`、stdout 保持为空、指纹格式、stdin 立即 EOF、状态目录不可用仍可启动 |
+| `search` | 103 | **分页边界 26/25**、翻页不重叠、字段完整性与 `missing_fields`、缓存命中/过期/持久化/关闭、并发合并、多查询合并去重、`auto_paginate` 上限、`max_requests`、参数大小写与 `%20` 编码、`doi`/`article_number` 排他性、非法输入拒绝、便捷工具、`ieee_status` 清理与重置 |
 | `resilience` | 60 | 401/403/400/404 不重试、429 `Retry-After`、5xx 重试与耗尽、超时、**重试计入预算**、本地预算拦截、**跨进程账本**、**跨进程限速**、密钥全链路脱敏 |
-| `export` | 56 | CSV BOM/行数/中文/溯源列、JSON meta、BibTeX 条目与注释头、sidecar 溯源、**含中文与空格的路径**、显式 records 导出、DOI/article_number 查询、`ieee_status` |
+| `export` | 58 | CSV BOM/行数/中文/溯源列、JSON meta、BibTeX 条目与注释头、sidecar 溯源、**含中文与空格的路径**、显式 records 导出、DOI/article_number 查询、`ieee_status` |
 
-真实 API 验证见 `docs/测试报告.md`（记录实际调用次数，仅有少量验证性调用）。
+真实 API 验证见 `docs/测试报告.md`（共 28 次调用：12 次诊断探测 + 6 次检索冒烟 + 10 次分页/合并验证）。
 
 ---
 
@@ -541,13 +564,30 @@ $env:IEEE_TEST_TARGET="bundle"; node test/run-all.mjs   # 测未打包 bundle，
 4. **本地计数 ≠ 官方额度**：IEEE 未公布重置时区，本地账本仅作自我保护；与 IEEE 控制台不一致时
    以 IEEE 为准。可删除 `state_dir/usage-ledger.json`，或调用
    `ieee_status({reset_local_usage:true})` 重置本地记账。
-5. **缓存/结果集是本地副本**：受 IEEE ToU 约束，均设条目与时间上限，不做无限镜像。
-6. **产物自身未做代码签名**（无代码签名证书），Windows SmartScreen 首次运行可能提示
+5. **IEEE 不返回限流响应头**：实测正常响应中既无 `X-RateLimit-*` 也无 `Retry-After`，
+   因此本地计数**无法**与官方剩余额度对账（`ieee_status.last_ieee_rate_limit_headers`
+   在 IEEE 开始返回时会自动显示）。
+6. **缓存/结果集是本地副本**：受 IEEE ToU 约束，均设条目与时间上限，不做无限镜像。
+7. **产物自身未做代码签名**（无代码签名证书），Windows SmartScreen 首次运行可能提示
    "未知发布者"；请用 `dist/SHA256SUMS.txt` 校验完整性。
-7. **`publication_year` 格式不统一**：官方说明其格式随出版物而异，本服务原样透传字符串。
-8. **BibTeX 为 UTF-8 原文**，仅转义 `{`/`}`/`\`；老式 BibTeX 引擎可能需要 biblatex 或 UTF-8 支持。
-9. **EXE 体积约 87 MB**：单文件自包含 Node 运行时的代价。
-10. **仅验证 Windows x64**：构建脚本按 Windows PE / SEA 流程编写，其他平台未验证。
+8. **`publication_year` 格式不统一**：官方说明其格式随出版物而异，本服务原样透传字符串。
+9. **BibTeX 为 UTF-8 原文**，仅转义 `{`/`}`/`\`；老式 BibTeX 引擎可能需要 biblatex 或 UTF-8 支持。
+10. **EXE 体积约 87 MiB**：单文件自包含 Node 运行时的代价。
+11. **仅验证 Windows x64**：构建脚本按 Windows PE / SEA 流程编写，其他平台未验证。
+12. **字节级可复现依赖构建环境**：同一 Node 大版本下已验证两次构建 SHA-256 相同；
+    换用不同 Node 版本时 blob 必然不同（Node 运行时本身不同），此时请以新的
+    `dist/SHA256SUMS.txt` 为准。
+
+### 真实接口行为提示（已实测）
+
+- **`article_number` / `doi` 必须单独发送**。只要附带 `max_records`，IEEE 会返回
+  `total_records: 1` 却**完全省略 `articles` 数组**（HTTP 200，无任何错误提示）。
+  本服务因此对标识符查询只发送标识符本身；上游实现恰好是 `{max_records:1, doi|article_number}`，
+  所以它的 `get_paper_details` / `get_paper_citations` 在真实接口上一直是静默失效的。
+- **无效/未激活的 key 得到的是 HTTP 403**（`Developer Inactive`），不是 401；
+  本服务在错误提示中已明确指出这一点，且不对 403 重试。
+- 少数历史文献可由检索命中、但用 `article_number` 取不到记录体；此时返回空结果并给出说明，
+  不会编造数据。
 
 ---
 

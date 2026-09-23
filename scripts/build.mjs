@@ -40,10 +40,15 @@ async function main() {
     process.stdout.write(`    sha256 ${artifact.sha256}\n`);
   }
   process.stdout.write(`checksums: ${sumsFile}\n`);
-  process.stdout.write(`useCodeCache=${sea.useCodeCache}, sea blob ${sea.blobSize} bytes\n`);
   process.stdout.write(
-    "\nRun the verification suite with: node test/run-all.mjs\n"
+    `useCodeCache=${sea.useCodeCache}, byte-reproducible=${sea.reproducible}, sea blob ${sea.blobSize} bytes\n`
   );
+  process.stdout.write(
+    sea.reproducible
+      ? "Byte-reproducible: re-running the build produces the same SHA-256.\n"
+      : "Note: with the V8 code cache enabled the executable is NOT byte-identical across rebuilds.\n"
+  );
+  process.stdout.write("\nRun the verification suite with: node test/run-all.mjs\n");
 }
 
 await main();
