@@ -4,8 +4,8 @@ Search IEEE Xplore from any MCP-capable AI agent and get back structured paper
 metadata — title, authors, year, venue, abstract, keywords, DOI, article number,
 abstract URL and PDF link — so the agent can screen candidates for relevance.
 
-Ships as a single Windows x64 executable: no Node.js, no npm, no npx, nothing
-downloaded at startup.
+Ships as a single executable — Windows x64 (`ieee-mcp.exe`) or Linux amd64
+(`ieee-mcp-linux-amd64`): no Node.js, no npm, no npx, nothing downloaded at startup.
 
 > **Scope.** The IEEE Metadata Search API searches *configured metadata fields and
 > the abstract text*, not article bodies, and this server does not download PDFs.
@@ -16,18 +16,31 @@ downloaded at startup.
 
 ## Install
 
-**Prebuilt** — grab `ieee-mcp.exe` from the release and put it anywhere. Paths with
+**Prebuilt** — take the binary for your platform and put it anywhere. Paths with
 spaces or non-ASCII characters are fine.
 
-```powershell
-.\ieee-mcp.exe --self-test   # print the effective config (key shown as a hash only)
+| Platform | File |
+|---|---|
+| Windows x64 | `ieee-mcp.exe` |
+| Linux amd64 | `ieee-mcp-linux-amd64` |
+
+```bash
+./ieee-mcp-linux-amd64 --self-test   # print the effective config (key shown as a hash only)
 ```
 
-**From source** — Node.js ≥ 20 on the build machine only; offline after install.
+The Linux build needs glibc 2.28 or newer (Ubuntu 20.04+, Debian 10+, RHEL 8+).
+Linux arm64 and musl/Alpine are not built.
 
-```powershell
+**From source** — Node.js ≥ 20 on the build machine only; offline after install.
+The build is native: run it on Windows for the Windows binary, on Linux for the
+Linux one. Cross-building is refused rather than attempted, because a binary that
+cannot be executed where it was made cannot be tested either — use the
+[build workflow](.github/workflows/build.yml), which builds each target on its own
+runner and runs the full suite there.
+
+```bash
 npm install
-node scripts/build.mjs     # → dist/ieee-mcp.exe + dist/SHA256SUMS.txt
+node scripts/build.mjs     # → dist/<binary> + dist/SHA256SUMS.txt
 ```
 
 ## API key
@@ -39,7 +52,7 @@ Indexing*) and pass it in the environment:
 "env": { "IEEE_API_KEY": "your-key-here" }
 ```
 
-The key is never written to disk, never embedded in the exe, and never logged: all
+The key is never written to disk, never embedded in the binary, and never logged: all
 output is scrubbed, and `ieee_status` reports only a `sha256(key)` fingerprint so
 you can confirm which key is loaded.
 
@@ -68,7 +81,8 @@ Config file locations differ per client; the format is the same everywhere.
 }
 ```
 
-`command` must be the absolute path to the exe. Restart the client after editing,
+`command` is the absolute path to the binary — `ieee-mcp.exe` on Windows,
+`ieee-mcp-linux-amd64` on Linux. Restart the client after editing,
 then ask the agent to call `ieee_status` to confirm it loaded. Through a proxy, add
 `"NODE_USE_ENV_PROXY": "1"` and `"HTTPS_PROXY": "http://127.0.0.1:<proxy_port>"`.
 
@@ -81,7 +95,7 @@ then ask the agent to call `ieee_status` to confirm it loaded. Through a proxy, 
 | `IEEE_API_KEY` / `IEEE_API_KEY_FILE` | — | Your key, supplied one way or the other |
 | `CROSSREF_MAILTO` | — | Crossref contact address — **recommended**, doubles your rate limit |
 | `IEEE_OUTPUT_DIR` | working directory | Base for relative export paths |
-| `IEEE_MCP_STATE_DIR` | `%LOCALAPPDATA%\ieee-mcp` | Usage ledger, cache, result sets |
+| `IEEE_MCP_STATE_DIR` | `%LOCALAPPDATA%\ieee-mcp` (Windows), `~/.ieee-mcp` (Linux) | Usage ledger, cache, result sets |
 | `IEEE_DAILY_BUDGET` | `200` | Local call budget — see [Constraints](#constraints-of-the-non-commercial-api) |
 | `IEEE_MAX_RPS` | `8` | Requests/second cap, 1–10 |
 | `IEEE_LOG_LEVEL` | `info` | `silent` / `error` / `warn` / `info` / `debug` |
