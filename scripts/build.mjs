@@ -1,0 +1,49 @@
+/**
+ * Full reproducible build.
+ *
+ *   node scripts/build.mjs
+ *
+ * Steps: clean -> typecheck -> bundle -> SEA blob -> executable -> checksums.
+ * Requires only a local Node.js (>= 20) and `npm install` in this directory.
+ * The produced dist/ieee-mcp.exe needs no Node.js, npm or npx at run time.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+
+import { BUILD_DIR, DIST_DIR, bundle, typecheck } from "./bundle.mjs";
+import { buildSea } from "./build-sea.mjs";
+import { writeChecksums } from "./checksums.mjs";
+
+function clean() {
+  for (const dir of [BUILD_DIR, DIST_DIR]) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    process.stdout.write(`cleaned ${path.relative(process.cwd(), dir) || dir}\n`);
+  }
+}
+
+async function main() {
+  const started = Date.now();
+  process.stdout.write("ieee-mcp build\n");
+
+  clean();
+  typecheck();
+  bundle();
+  const sea = await buildSea();
+  const { sumsFile, info } = writeChecksums();
+
+  process.stdout.write("\n-----------------------------------------\n");
+  process.stdout.write(`built in ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+  for (const artifact of info.artifacts) {
+    process.stdout.write(`  ${artifact.path}  ${artifact.bytes} bytes\n`);
+    process.stdout.write(`    sha256 ${artifact.sha256}\n`);
+  }
+  process.stdout.write(`checksums: ${sumsFile}\n`);
+  process.stdout.write(`useCodeCache=${sea.useCodeCache}, sea blob ${sea.blobSize} bytes\n`);
+  process.stdout.write(
+    "\nRun the verification suite with: node test/run-all.mjs\n"
+  );
+}
+
+await main();
