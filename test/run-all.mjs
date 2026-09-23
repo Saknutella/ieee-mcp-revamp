@@ -14,7 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { describeTarget, REPO_ROOT } from "./harness.mjs";
+import { BUNDLE_PATH, describeTarget, EXE_PATH, REPO_ROOT } from "./harness.mjs";
 import { run as protocol } from "./e2e-protocol.mjs";
 import { run as cli } from "./e2e-cli.mjs";
 import { run as search } from "./e2e-search.mjs";
@@ -33,6 +33,21 @@ const suites = [
 
 const only = process.argv.slice(2).filter((arg) => !arg.startsWith("-"));
 const target = describeTarget();
+
+// Fail fast when there is nothing to test. Without this, a build that produced
+// no artifact surfaces as a cascade of "cannot read property of undefined"
+// failures from suites that never got a response, which buries the real cause.
+const mode = process.env.IEEE_TEST_TARGET ?? "exe";
+const artifact = mode === "bundle" ? BUNDLE_PATH : EXE_PATH;
+if (!fs.existsSync(artifact)) {
+  process.stdout.write(
+    `\nnothing to test: ${path.relative(REPO_ROOT, artifact)} does not exist.\n` +
+      (mode === "bundle"
+        ? "build it first: node scripts/bundle.mjs\n"
+        : "build it first: node scripts/build.mjs\n")
+  );
+  process.exit(2);
+}
 
 process.stdout.write(`ieee-mcp test suite\ntarget: ${target}\n`);
 
