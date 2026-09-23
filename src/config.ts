@@ -46,6 +46,21 @@ export interface Config {
   outputDir: string;
   logLevel: LogLevel;
   userAgent: string;
+
+  /**
+   * Crossref is a SECOND, independent data source used only for reference
+   * lists. It never consumes the IEEE call budget.
+   */
+  crossrefEnabled: boolean;
+  crossrefApiBase: string;
+  crossrefIsDefaultBase: boolean;
+  crossrefMailto: string | null;
+  crossrefMaxRps: number;
+  /** Upper bound on how many papers one reference lookup may query. */
+  maxDoisPerCall: number;
+  /** Upper bound on authoritative BibTeX fetches (one request each). */
+  maxBibtexFetchesPerCall: number;
+
   /** Non-fatal problems found while reading the environment. */
   warnings: string[];
 }
@@ -218,6 +233,31 @@ export function loadConfig(): Config {
 
   const userAgent = rawEnv("IEEE_USER_AGENT") ?? `${SERVER_NAME}/${SERVER_VERSION} (MCP stdio server)`;
 
+  const crossrefEnabled = (rawEnv("IEEE_MCP_CROSSREF_ENABLED") ?? "1") !== "0";
+  const crossrefBaseOverride = rawEnv("CROSSREF_API_BASE");
+  let crossrefApiBase = "https://api.crossref.org";
+  let crossrefIsDefaultBase = true;
+  if (crossrefBaseOverride) {
+    try {
+      const parsed = new URL(crossrefBaseOverride);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("must be http or https");
+      crossrefApiBase = parsed.toString().replace(/\/$/, "");
+      crossrefIsDefaultBase = false;
+    } catch (error) {
+      warnings.push(`CROSSREF_API_BASE is not a valid URL (${redact(error)}); using the official endpoint.`);
+    }
+  }
+  const crossrefMailto = rawEnv("CROSSREF_MAILTO") ?? null;
+  if (crossrefEnabled && !crossrefMailto) {
+    warnings.push(
+      "CROSSREF_MAILTO is not set. Crossref's polite pool gives better throughput and stability when " +
+        "requests identify a contact address; set CROSSREF_MAILTO to your e-mail to join it."
+    );
+  }
+  const crossrefMaxRps = intEnv("CROSSREF_MAX_RPS", 3, 1, 20, warnings);
+  const maxDoisPerCall = intEnv("IEEE_MCP_MAX_DOIS_PER_CALL", 20, 1, 100, warnings);
+  const maxBibtexFetchesPerCall = intEnv("IEEE_MCP_MAX_BIBTEX_PER_CALL", 25, 0, 200, warnings);
+
   if (maxRps > 10) {
     warnings.push(
       "IEEE_MAX_RPS above 10 exceeds the documented IEEE rate limit and has been clamped."
@@ -248,6 +288,13 @@ export function loadConfig(): Config {
     outputDir,
     logLevel,
     userAgent,
+    crossrefEnabled,
+    crossrefApiBase,
+    crossrefIsDefaultBase,
+    crossrefMailto,
+    crossrefMaxRps,
+    maxDoisPerCall,
+    maxBibtexFetchesPerCall,
     warnings,
   };
   return config;
@@ -274,6 +321,12 @@ export function describeConfig(config: Config): Record<string, unknown> {
     log_level: config.logLevel,
     platform: `${process.platform}-${process.arch}`,
     node: process.version,
+    crossref_enabled: config.crossrefEnabled,
+    crossref_api_base: config.crossrefApiBase,
+    crossref_api_base_overridden: !config.crossrefIsDefaultBase,
+    crossref_polite_pool: Boolean(config.crossrefMailto),
+    crossref_max_rps: config.crossrefMaxRps,
+    max_dois_per_call: config.maxDoisPerCall,
   };
 }
 

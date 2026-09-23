@@ -20,11 +20,13 @@ import { run as cli } from "./e2e-cli.mjs";
 import { run as search } from "./e2e-search.mjs";
 import { run as resilience } from "./e2e-resilience.mjs";
 import { run as exportSuite } from "./e2e-export.mjs";
+import { run as crossrefSuite } from "./e2e-crossref.mjs";
 
 const suites = [
   ["protocol", protocol],
   ["cli", cli],
   ["search", search],
+  ["crossref", crossrefSuite],
   ["resilience", resilience],
   ["export", exportSuite],
 ];

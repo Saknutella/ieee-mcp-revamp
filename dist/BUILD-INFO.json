@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-23T04:03:03.063Z",
+  "generated_at": "2026-09-23T07:08:44.113Z",
   "node": "v24.12.0",
   "v8": "13.6.233.17-node.37",
   "platform": "win32-x64",
@@ -11,18 +11,18 @@
   "artifacts": [
     {
       "path": "dist/ieee-mcp.exe",
-      "bytes": 90894848,
-      "sha256": "9b7f48368cc30602f4669b341fd9a436001c95f64b559b18881beeb65ce32d3d"
+      "bytes": 90929664,
+      "sha256": "12d50ce00a7c536070442a01c6e18c6ff8d515dfccc5c98856a4353f56b745c8"
     },
     {
       "path": "build/bundle.cjs",
-      "bytes": 832503,
-      "sha256": "1ff1b05a9fa3b3ca0d2817e4187e7214f717e73b3cb52c6d2a6ed7504aac29b4"
+      "bytes": 867436,
+      "sha256": "28051c82c71d478450b9cd87cd72e5c18527d4ab706c5e7c89e884f051019b1e"
     },
     {
       "path": "build/ieee-mcp.blob",
-      "bytes": 832544,
-      "sha256": "4ebef8e557376e73d3b574a1de841ab700f05216967e81aaa41ac0f40f52e872"
+      "bytes": 867477,
+      "sha256": "ae8ece2be753184358420256b46d3a63de285bc328d604659fda20cb4ed8a3e0"
     }
   ]
 }

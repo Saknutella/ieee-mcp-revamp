@@ -54,9 +54,9 @@ Get-Content .\dist\SHA256SUMS.txt
 
 | 文件 | 字节 | SHA-256 |
 |---|---|---|
-| `dist/ieee-mcp.exe` | 90,894,848 | `9b7f48368cc30602f4669b341fd9a436001c95f64b559b18881beeb65ce32d3d` |
-| `build/bundle.cjs` | 832,503 | `1ff1b05a9fa3b3ca0d2817e4187e7214f717e73b3cb52c6d2a6ed7504aac29b4` |
-| `build/ieee-mcp.blob` | 832,544 | `4ebef8e557376e73d3b574a1de841ab700f05216967e81aaa41ac0f40f52e872` |
+| `dist/ieee-mcp.exe` | 90,929,664 | `12d50ce00a7c536070442a01c6e18c6ff8d515dfccc5c98856a4353f56b745c8` |
+| `build/bundle.cjs` | 867,436 | `28051c82c71d478450b9cd87cd72e5c18527d4ab706c5e7c89e884f051019b1e` |
+| `build/ieee-mcp.blob` | 867,477 | `ae8ece2be753184358420256b46d3a63de285bc328d604659fda20cb4ed8a3e0` |
 
 构建是**字节级可复现**的（详见下文"可复现构建"），因此这些校验和可用于验证源码与二进制的对应关系。
 
@@ -103,6 +103,7 @@ Get-Content .\dist\SHA256SUMS.txt
       "args": [],
       "env": {
         "IEEE_API_KEY": "<你的 IEEE Metadata Search API Key>",
+        "CROSSREF_MAILTO": "<你的邮箱，可选但建议>",
         "IEEE_MCP_STATE_DIR": "D:/工具/IEEE MCP/state",
         "IEEE_OUTPUT_DIR": "D:/检索结果",
         "IEEE_LOG_LEVEL": "info"
@@ -170,11 +171,97 @@ curl.exe --proxy http://127.0.0.1:7890 "https://ieeexploreapi.ieee.org/api/v1/se
 | `search_by_publication` | 在指定期刊/会议内检索 |
 | `get_paper_details` | 按 DOI 或 article_number 取单篇完整元数据 |
 | `get_paper_citations` | 取单篇的引用论文数 / 引用专利数 |
+| `get_references` | **取参考文献列表（数据源是 Crossref，不是 IEEE）**，支持 BibTeX |
 | `export_results` | 导出 UTF-8 CSV / JSON / BibTeX |
-| `ieee_status` | 生效配置、本地调用计数、缓存统计、IEEE 返回的限流响应头 |
+| `ieee_status` | 生效配置、本地调用计数、缓存统计、IEEE 与 Crossref 状态 |
 
 > `get_full_text` 已被**移除**：上游请求的 `/api/v1/search/document/{articleNumber}`
 > 在官方文档中并不存在，且把校园网权限误当作 API token。详见 `docs/上游源码审计.md`。
+
+---
+
+## `get_references`：参考文献查询（第二个数据源）
+
+### 为什么需要它
+
+IEEE Metadata Search API **完全没有参考文献字段**——`citing_paper_count` 和
+`citing_patent_count` 都是"**被**引用"的次数，两个都是**进来的**。想拿到"这篇引了谁"，
+IEEE 侧无解，只能换数据源。
+
+### 来源必须说清楚
+
+| | |
+|---|---|
+| 数据源 | **Crossref REST API**（`source: "Crossref REST API"`, `source_is_ieee: false`） |
+| 内容 | 出版商存缴的参考文献条目，含出版商的引用键 `ref1` / `ref2` … |
+| 不是 | **不是 IEEE 元数据**。IEEE 侧无法交叉验证或推翻 Crossref 的这份列表 |
+| 必须 | **自行核验**（响应里 `verification_required: true`，并附 IEEE Xplore 页面链接） |
+
+**核验依据（小样本，请勿过度外推）**：2026-09 用 2 篇 IEEE 论文逐位核对，
+Crossref 与 IEEE Xplore 页面**完全一致**——IEEE TCSII 2021（art. 9422824）14/14，
+ESSCIRC 2019（art. 8902902）7/7，**连出版商没给 DOI 的那几条都对得上**。
+但 2 篇是 2 篇，不是保证。
+
+### 用法
+
+```jsonc
+// 单个或多个 DOI
+{ "dois": ["10.1109/TCSII.2021.3077589", "10.1109/ESSCIRC.2019.8902902"] }
+
+// 或直接接着一次 IEEE 检索的结果（会自动附上 IEEE 页面核验链接）
+{ "search_id": "srch_m1a2b3c4d5" }
+{ "search_id": "srch_m1a2b3c4d5", "article_numbers": ["9422824"] }
+
+// 输出格式
+{ "dois": ["10.1109/TCSII.2021.3077589"], "output_format": "markdown" }
+{ "dois": ["10.1109/TCSII.2021.3077589"], "output_format": "bibtex" }
+```
+
+### 返回内容
+
+每篇给出：`references_returned`（实际条目数）、`references_count_from_crossref`
+（Crossref 自己的计数字段）、`counts_agree`（两者是否一致，不一致会告警）、
+`with_doi` / `without_doi`、`crossref_url`，以及**核验链接**：
+`verify.crossref` / `verify.doi` / `verify.ieee_xplore`。
+
+**条目按出版商的引用键排序**，即恢复论文里的编号顺序（ref1 → ref14）。
+Crossref 接口本身返回的是存缴顺序，不是引用顺序，本服务会重新排好。
+
+### BibTeX
+
+| `bibtex_mode` | 行为 | 代价 |
+|---|---|---|
+| `generated`（默认） | 用 Crossref 存缴的字段本地生成 | 0 次额外请求 |
+| `crossref` | 对**每个带 DOI 的条目**走 Crossref 内容协商取权威 BibTeX | 每条 1 次请求（免费，上限 `IEEE_MCP_MAX_BIBTEX_PER_CALL`） |
+| `none` | 不生成 | 0 |
+
+**强烈建议对 IEEE 论文用 `crossref`**：实测 TCSII 那 14 条里有 10 条 Crossref **只存了 DOI、
+没有标题/作者/年份**，`generated` 模式只能产出空壳条目（会带一条说明性 `note`）；
+`crossref` 模式下这 10 条全部变成完整条目（含完整作者列表、页码、ISSN，那本 Springer 专著
+还正确识别成了 `@book`）。
+
+`generated` 模式的 `entry_type` 是**从容器标题猜的**（期刊/会议），可能猜错；
+权威模式没有这个问题。两种模式都会在 `bibtex` 输出头部写明来源与核验要求。
+
+### 边界与代价
+
+- **Crossref 请求不消耗 IEEE 额度**，也不写入 IEEE 账本（`ieee_status` 里分开显示）。
+  实测：不配置 `IEEE_API_KEY` 也能正常使用 `get_references`。
+- 单次最多查 `IEEE_MCP_MAX_DOIS_PER_CALL`（默认 20）篇；超出会裁剪并告警。
+- **记录没有 DOI 就被跳过**（Crossref 只能用 DOI 查），跳过的会列在 `warnings` 里。
+- 无 DOI 的参考文献条目**无法自动解析**，Crossref 仍保留其 title/author/year，需人工匹配。
+- 建议设 `CROSSREF_MAILTO` 加入 Crossref 的 polite pool（有更好的吞吐与稳定性）。
+- 用 `IEEE_MCP_CROSSREF_ENABLED=0` 可整体关闭这个数据源。
+
+### ⚠️ 别把两个"引用数"混用
+
+| 指标 | 含义 | 来源 |
+|---|---|---|
+| 参考文献数 | 这篇**引用了**多少篇（outgoing） | Crossref `reference[]` |
+| 被引次数 | 这篇**被**多少篇引用（incoming） | IEEE `citing_paper_count` / Crossref `is-referenced-by-count` / OpenAlex `cited_by_count` |
+
+两个方向的数字不能放在一起比。另外实测这三个源的**被引次数并不总是一致**
+（同一篇 ESSCIRC 2019：IEEE 15 / Crossref 15 / OpenAlex 18），**跨源比较被引数要谨慎**。
 
 ### `search_papers` 主要参数
 
@@ -463,6 +550,12 @@ next_start_record   = last_returned_index + 1
 | `IEEE_LOG_LEVEL` | `info` | `silent`/`error`/`warn`/`info`/`debug`（全部写 stderr） |
 | `IEEE_USER_AGENT` | `ieee-mcp/2.0.0 (MCP stdio server)` | 请求 UA |
 | `IEEE_API_BASE` | 官方端点 | **仅供离线测试**指向 mock 服务；覆盖时会在 stderr 告警 |
+| `IEEE_MCP_CROSSREF_ENABLED` | `1` | 设为 `0` 关闭 `get_references`（Crossref 数据源） |
+| `CROSSREF_MAILTO` | — | 联系邮箱，加入 Crossref polite pool（**建议设置**） |
+| `CROSSREF_API_BASE` | `https://api.crossref.org` | **仅供离线测试** |
+| `CROSSREF_MAX_RPS` | `3` | Crossref 请求频率上限（礼貌限速） |
+| `IEEE_MCP_MAX_DOIS_PER_CALL` | `20` | 单次 `get_references` 最多查几篇 |
+| `IEEE_MCP_MAX_BIBTEX_PER_CALL` | `25` | 单次最多取多少条权威 BibTeX |
 
 ---
 
@@ -533,23 +626,26 @@ $env:IEEE_BUILD_CODE_CACHE="1"; node scripts/build.mjs   # 开启 code cache，�
 ## 测试
 
 ```powershell
-node test/run-all.mjs                       # 默认测 dist/ieee-mcp.exe（277 项）
+node test/run-all.mjs                       # 默认测 dist/ieee-mcp.exe（363 项）
 node test/run-all.mjs search export         # 只跑指定套件
+node test/run-all.mjs crossref              # 只跑 Crossref 参考文献套件
 $env:IEEE_TEST_TARGET="bundle"; node test/run-all.mjs   # 测未打包 bundle，迭代更快
 ```
 
-测试**默认全部使用内置 mock 服务**（`test/mock-ieee-server.mjs`，响应形状对齐官方
-"Data Fields Returned"），**不消耗任何真实 API 额度**。覆盖：
+测试**默认全部使用内置 mock 服务**（`test/mock-ieee-server.mjs`、
+`test/mock-crossref-server.mjs`，响应形状分别对齐 IEEE "Data Fields Returned" 与
+Crossref `/works` 接口），**不消耗任何真实 API 额度**。覆盖：
 
 | 套件 | 项数 | 覆盖内容 |
 |---|---|---|
 | `protocol` | 30 | `initialize`、`tools/list`、stdout 纯净性、stdout/stderr 分离、无密钥降级、`get_full_text` 已移除、未知工具错误 |
 | `cli` | 26 | `--version`/`--help`/`--self-test`、stdout 保持为空、指纹格式、stdin 立即 EOF、状态目录不可用仍可启动 |
 | `search` | 103 | **分页边界 26/25**、翻页不重叠、字段完整性与 `missing_fields`、缓存命中/过期/持久化/关闭、并发合并、多查询合并去重、`auto_paginate` 上限、`max_requests`、参数大小写与 `%20` 编码、`doi`/`article_number` 排他性、非法输入拒绝、便捷工具、`ieee_status` 清理与重置 |
+| `crossref` | 86 | **来源标注为 Crossref 而非 IEEE**、`verification_required`、**IEEE 额度零消耗与账本隔离**、引用键排序还原论文编号、带/不带 DOI 的条目、仅 DOI 条目的说明、计数不一致告警、部分失败、404、`search_id` 接入与 IEEE 核验链接、DOI 无数值被跳过、三种 BibTeX 模式、politeness UA、缓存、重试、禁用与上限 |
 | `resilience` | 60 | 401/403/400/404 不重试、429 `Retry-After`、5xx 重试与耗尽、超时、**重试计入预算**、本地预算拦截、**跨进程账本**、**跨进程限速**、密钥全链路脱敏 |
 | `export` | 58 | CSV BOM/行数/中文/溯源列、JSON meta、BibTeX 条目与注释头、sidecar 溯源、**含中文与空格的路径**、显式 records 导出、DOI/article_number 查询、`ieee_status` |
 
-真实 API 验证见 `docs/测试报告.md`（共 28 次调用：12 次诊断探测 + 6 次检索冒烟 + 10 次分页/合并验证）。
+真实 API 验证见 `docs/测试报告.md`（IEEE 28 次调用 + Crossref 免费调用）。
 
 ---
 

@@ -31,6 +31,14 @@ import {
   type SortOrder,
 } from "./ieeeSpec.js";
 import { executeIdentifierLookup, executeSearch, type SearchContext } from "./searchService.js";
+import type { CrossrefClient } from "./crossref.js";
+import {
+  attachIeeeVerifyLinks,
+  lookupReferences,
+  resolveDoiList,
+  type BibtexMode,
+} from "./references.js";
+import { referencesToBibtex, referencesToMarkdown } from "./format.js";
 import type { PaperRecord, SearchResultPayload } from "./types.js";
 
 const CONTENT_TYPE_ENUM = z.enum([...CONTENT_TYPES] as [ContentType, ...ContentType[]]);
@@ -67,6 +75,7 @@ export interface ToolDependencies {
   cache: DiskCache;
   results: ResultStore;
   searchContext: SearchContext;
+  crossref: CrossrefClient;
 }
 
 function renderPayload(payload: SearchResultPayload, format: OutputFormat): string {
@@ -112,7 +121,7 @@ function fail(error: unknown): ToolResult {
 }
 
 export function registerTools(server: McpServer, deps: ToolDependencies): void {
-  const { config, cache, results, searchContext } = deps;
+  const { config, cache, results, searchContext, crossref } = deps;
 
   // ── search_papers ────────────────────────────────────────────────────────────
   server.registerTool(
@@ -489,16 +498,123 @@ export function registerTools(server: McpServer, deps: ToolDependencies): void {
     }
   );
 
+  // ── get_references ───────────────────────────────────────────────────────────
+  server.registerTool(
+    "get_references",
+    {
+      title: "Get reference lists (source: Crossref, NOT IEEE)",
+      description:
+        "Return the OUTGOING reference list (bibliography) of one or more papers, with counts and " +
+        "optional BibTeX. " +
+        "DATA SOURCE IS CROSSREF, NOT IEEE: the IEEE Xplore Metadata Search API exposes no reference " +
+        "list at all (citing_paper_count / citing_patent_count are INCOMING citation counts). Crossref " +
+        "reference metadata is deposited by the publisher and keeps the publisher's citation keys " +
+        "(ref1, ref2, ...), which preserve in-paper numbering. " +
+        "VERIFICATION REQUIRED: Crossref matched IEEE Xplore exactly on the sampled papers (2 papers, " +
+        "21 references, position by position), but that is a small sample - always compare the result " +
+        "against the References section of the paper page on IEEE Xplore before relying on it. " +
+        "Each entry reports whether a DOI was deposited; entries without a DOI cannot be resolved " +
+        "automatically. These lookups are free and do NOT consume the IEEE daily budget.",
+      inputSchema: {
+        dois: z
+          .array(z.string())
+          .max(100)
+          .optional()
+          .describe("One or more DOIs. Non-IEEE DOIs work too; Crossref is not limited to IEEE content."),
+        search_id: z
+          .string()
+          .optional()
+          .describe(
+            "Take the DOIs from a stored IEEE search result instead of listing them by hand. " +
+              "Records without a DOI are reported as skipped, because Crossref needs a DOI."
+          ),
+        article_numbers: z
+          .array(z.string())
+          .optional()
+          .describe("With search_id: restrict the lookup to these IEEE article numbers."),
+        bibtex_mode: z
+          .enum(["none", "generated", "crossref"])
+          .optional()
+          .describe(
+            "`generated` (default) builds BibTeX from the deposited fields with no extra requests. " +
+              "`crossref` fetches authoritative BibTeX per DOI-bearing reference (one request each, " +
+              "capped by IEEE_MCP_MAX_BIBTEX_PER_CALL). `none` omits BibTeX."
+          ),
+        output_format: z
+          .enum(["json", "markdown", "bibtex"])
+          .optional()
+          .describe("json (default, also fills structuredContent) | markdown | bibtex."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (args) => {
+      try {
+        let records: PaperRecord[] | undefined;
+        if (args.search_id) {
+          if (!isValidSearchId(args.search_id)) {
+            throw new InputError(
+              `Malformed search_id "${args.search_id}".`,
+              "Use the search_id returned by a search tool, e.g. srch_abc123."
+            );
+          }
+          const stored = results.load(args.search_id);
+          if (!stored) {
+            throw new InputError(
+              `No stored result set for search_id "${args.search_id}".`,
+              "Result sets expire and only the most recent are kept. Run the search again, or pass `dois`."
+            );
+          }
+          records = stored.articles;
+        }
+        if (!args.dois?.length && !records) {
+          throw new InputError(
+            "Provide either `dois` or `search_id`.",
+            "Crossref is keyed by DOI, so a DOI (or an IEEE result set containing DOIs) is required."
+          );
+        }
+
+        const resolved = resolveDoiList({
+          dois: args.dois,
+          records,
+          articleNumbers: args.article_numbers,
+          maxDois: config.maxDoisPerCall,
+        });
+        const bibtexMode: BibtexMode = (args.bibtex_mode ?? "generated") as BibtexMode;
+        const payload = await lookupReferences(
+          { config, crossref },
+          { ...resolved, bibtexMode }
+        );
+        if (records) attachIeeeVerifyLinks(payload, records);
+
+        const format = args.output_format ?? "json";
+        const text =
+          format === "markdown"
+            ? referencesToMarkdown(payload)
+            : format === "bibtex"
+              ? referencesToBibtex(payload)
+              : toJsonText(payload);
+
+        const result: ToolResult = { content: [{ type: "text", text }] };
+        if (format === "json") {
+          result.structuredContent = payload as unknown as Record<string, unknown>;
+        }
+        return result;
+      } catch (error) {
+        return fail(error);
+      }
+    }
+  );
+
   // ── ieee_status ──────────────────────────────────────────────────────────────
   server.registerTool(
     "ieee_status",
     {
-      title: "Show IEEE MCP configuration, local usage and cache state",
+      title: "Show configuration, local IEEE usage and cache state",
       description:
         "Report the effective configuration (with a hashed key fingerprint and no key material), " +
-        "this server's LOCAL call counting, cache statistics and any rate-limit headers IEEE returned. " +
-        "The local counter is not the official IEEE remaining quota. Optionally clear the cache or " +
-        "reset the local counter.",
+        "this server's LOCAL IEEE call counting, cache statistics, Crossref status, and any rate-limit " +
+        "headers IEEE returned. The local counter is not the official IEEE remaining quota. " +
+        "Optionally clear the cache or reset the local counter.",
       inputSchema: {
         include_config: z.boolean().optional().describe("Include the configuration block (default true)."),
         clear_cache: z.boolean().optional().describe("Delete every cached API response."),
@@ -561,6 +677,20 @@ export function registerTools(server: McpServer, deps: ToolDependencies): void {
           },
           result_sets: { ...results.stats(), ttl_seconds: config.resultTtlSeconds },
           last_ieee_rate_limit_headers: getLastRateLimitHeaders(),
+          crossref: {
+            enabled: config.crossrefEnabled,
+            api_base: config.crossrefApiBase,
+            api_base_overridden: !config.crossrefIsDefaultBase,
+            polite_pool: Boolean(config.crossrefMailto),
+            max_rps: config.crossrefMaxRps,
+            requests_this_process: crossref.stats.requests,
+            cache_hits_this_process: crossref.stats.cacheHits,
+            max_dois_per_call: config.maxDoisPerCall,
+            max_bibtex_fetches_per_call: config.maxBibtexFetchesPerCall,
+            role:
+              "Second data source used ONLY for reference lists (get_references). Crossref requests do NOT " +
+              "consume the IEEE daily budget and are not written to the IEEE usage ledger.",
+          },
         };
         return {
           content: [{ type: "text", text: toJsonText(summary) }],

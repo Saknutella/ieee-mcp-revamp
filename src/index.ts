@@ -18,6 +18,7 @@ import { setLogLevel, log, registerSecret, redact } from "./logger.js";
 import { IeeeMcpError, toIeeeMcpError } from "./errors.js";
 import { DiskCache } from "./cache.js";
 import { IeeeClient } from "./ieeeClient.js";
+import { CrossrefClient } from "./crossref.js";
 import { ResultStore } from "./resultStore.js";
 import { registerTools } from "./tools.js";
 import { ensureDir } from "./store.js";
@@ -225,6 +226,7 @@ async function main(): Promise<void> {
   const cache = new DiskCache(config);
   const client = new IeeeClient(config, cache);
   const results = new ResultStore(config);
+  const crossref = new CrossrefClient(config, cache);
 
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
   registerTools(server, {
@@ -232,6 +234,7 @@ async function main(): Promise<void> {
     client,
     cache,
     results,
+    crossref,
     searchContext: { config, client, results },
   });
 

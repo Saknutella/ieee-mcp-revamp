@@ -6,6 +6,7 @@
  */
 
 import type { PaperRecord, SearchResultPayload, UsageInfo } from "./types.js";
+import type { ReferenceLookupPayload } from "./references.js";
 
 export type OutputFormat = "json" | "markdown" | "csv" | "bibtex";
 
@@ -306,4 +307,136 @@ export function payloadToMarkdown(payload: SearchResultPayload): string {
     lines.push("");
   });
   return lines.join("\n");
+}
+
+// ── Crossref reference rendering ───────────────────────────────────────────────
+
+const PROVENANCE_BANNER = [
+  "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+  "!! SOURCE: Crossref REST API  --  NOT IEEE Xplore                          !!",
+  "!! Crossref reference lists are publisher-deposited. Verified against IEEE  !!",
+  "!! Xplore on a small sample only (2 papers, 21 references). VERIFY YOURSELF  !!",
+  "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+];
+
+export function referencesToBibtex(payload: ReferenceLookupPayload): string {
+  const lines: string[] = [
+    ...PROVENANCE_BANNER.map((line) => `% ${line}`),
+    `% source: ${payload.source}`,
+    `% retrieved_at: ${payload.retrieved_at}`,
+    `% bibtex_mode: ${payload.bibtex_mode}`,
+    `% references: ${payload.totals.references} (${payload.totals.with_doi} with DOI, ${payload.totals.without_doi} without)`,
+    "%",
+    "% Entries marked `generated_from_crossref_metadata` were built from the fields the",
+    "% publisher deposited (entry type inferred from the container title, so it can be wrong;",
+    "% `pages` is often only the first page, because that is all Crossref carries).",
+    "% Entries fetched via Crossref content negotiation are authoritative Crossref BibTeX.",
+    "%",
+    "% Entries are ordered by the publisher's citation key (ref1, ref2, ...), which preserves",
+    "% the numbering used in the paper. Anything without a derivable key is placed last.",
+    "%",
+    "% This is NOT IEEE metadata. IEEE Xplore exposes no reference list.",
+    "% Compare against the References section of each paper's IEEE Xplore page.",
+  ];
+
+  for (const paper of payload.papers) {
+    lines.push("%");
+    lines.push(`% ===== ${paper.requested_doi} =====`);
+    if (paper.work?.title) lines.push(`% ${paper.work.title}`);
+    if (!paper.ok) {
+      lines.push(`% LOOKUP FAILED (${paper.error?.code}): ${paper.error?.message}`);
+      continue;
+    }
+    lines.push(`% references returned: ${paper.references_returned}` +
+      (paper.references_count_from_crossref !== null
+        ? ` | Crossref references-count: ${paper.references_count_from_crossref}`
+        : ""));
+    if (paper.verify.ieee_xplore) lines.push(`% verify at: ${paper.verify.ieee_xplore}`);
+    lines.push(`% Crossref record: ${paper.crossref_url}`);
+    lines.push("");
+    for (const reference of paper.references) {
+      if (reference.bibtex) {
+        lines.push(reference.bibtex);
+        lines.push("");
+      }
+    }
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function referencesToMarkdown(payload: ReferenceLookupPayload): string {
+  const lines: string[] = [];
+  lines.push("# Crossref reference lookup");
+  lines.push("");
+  lines.push(...PROVENANCE_BANNER.map((line) => `> ${line}`));
+  lines.push("");
+  lines.push(`- **source**: ${payload.source} (\`source_is_ieee: false\`)`);
+  lines.push(`- **retrieved_at**: ${payload.retrieved_at}`);
+  lines.push(`- **papers requested**: ${payload.requested} (succeeded ${payload.succeeded}, failed ${payload.failed})`);
+  lines.push(
+    `- **references found**: ${payload.totals.references} ` +
+      `(${payload.totals.with_doi} with DOI, ${payload.totals.without_doi} without)`
+  );
+  lines.push(`- **bibtex_mode**: ${payload.bibtex_mode}`);
+  lines.push(`- **IEEE calls consumed**: ${payload.usage.ieee_calls_consumed} (${payload.usage.note})`);
+  lines.push("");
+  lines.push(`**What this is**: ${payload.provenance.what_this_is}`);
+  lines.push("");
+  lines.push(`**What this is not**: ${payload.provenance.what_this_is_not}`);
+  lines.push("");
+  lines.push(`**Verification**: ${payload.provenance.verification_note}`);
+  lines.push("");
+  lines.push(`**Metric warning**: ${payload.provenance.metric_warning}`);
+  lines.push("");
+
+  if (payload.warnings.length > 0) {
+    lines.push("Warnings:");
+    for (const warning of payload.warnings) lines.push(`- ${warning}`);
+    lines.push("");
+  }
+
+  for (const paper of payload.papers) {
+    lines.push("---");
+    lines.push("");
+    lines.push(`## ${paper.requested_doi}`);
+    if (!paper.ok) {
+      lines.push("");
+      lines.push(`**LOOKUP FAILED** — \`${paper.error?.code}\`: ${paper.error?.message}`);
+      lines.push("");
+      continue;
+    }
+    if (paper.work?.title) lines.push("");
+    if (paper.work?.title) {
+      lines.push(
+        `*${paper.work.title}*` +
+          (paper.work.container_title ? ` — ${paper.work.container_title}` : "") +
+          (paper.work.year ? ` (${paper.work.year})` : "")
+      );
+    }
+    lines.push("");
+    lines.push(
+      `- references returned: **${paper.references_returned}**` +
+        (paper.references_count_from_crossref !== null
+          ? ` | Crossref \`references-count\`: ${paper.references_count_from_crossref}` +
+            (paper.counts_agree === false ? " **(MISMATCH)**" : "")
+          : "")
+    );
+    lines.push(`- with DOI: ${paper.with_doi} | without DOI: ${paper.without_doi}`);
+    lines.push(`- incoming citations (different metric): ${paper.work?.is_referenced_by_count ?? "(not reported)"}`);
+    lines.push(`- Crossref record: ${paper.crossref_url}`);
+    if (paper.verify.ieee_xplore) lines.push(`- **verify against IEEE Xplore**: ${paper.verify.ieee_xplore}`);
+    lines.push("");
+    lines.push("| # | DOI | Title | Author | Year | Container |");
+    lines.push("|---|---|---|---|---|---|");
+    for (const reference of paper.references) {
+      const cell = (value: string | null): string =>
+        (value ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").slice(0, 90);
+      lines.push(
+        `| ${reference.order ?? reference.key ?? ""} | ${cell(reference.doi) || "*(none deposited)*"} | ` +
+          `${cell(reference.title)} | ${cell(reference.author)} | ${cell(reference.year)} | ${cell(reference.container)} |`
+      );
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
 }
