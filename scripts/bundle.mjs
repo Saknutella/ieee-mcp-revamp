@@ -45,10 +45,39 @@ export function typecheck() {
   ]);
 }
 
+/**
+ * How to invoke the esbuild CLI on this machine.
+ *
+ * The esbuild package ships `bin/esbuild` as a Node script on Windows but as the
+ * native executable on Linux and macOS, so `node bin/esbuild` only works on
+ * Windows — on Linux Node tries to parse an ELF image and dies with
+ * "SyntaxError: Invalid or unexpected token". The file header is inspected
+ * instead of the platform being assumed.
+ */
+function esbuildCommand() {
+  const shim = path.join(REPO_ROOT, "node_modules", "esbuild", "bin", "esbuild");
+  const head = fs.readFileSync(shim).subarray(0, 4);
+  const isNative =
+    (head[0] === 0x4d && head[1] === 0x5a) || // MZ — a PE image
+    (head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46); // \x7fELF
+
+  if (!isNative) return { command: process.execPath, args: [shim], how: "node script" };
+
+  // A native binary has to be executable. npm normally sets this, but the build
+  // should not fail for want of a permission bit.
+  try {
+    fs.accessSync(shim, fs.constants.X_OK);
+  } catch {
+    fs.chmodSync(shim, 0o755);
+  }
+  return { command: shim, args: [], how: "native binary" };
+}
+
 export function bundle() {
   fs.mkdirSync(BUILD_DIR, { recursive: true });
-  runStep("bundle (esbuild --format=cjs)", process.execPath, [
-    path.join(REPO_ROOT, "node_modules", "esbuild", "bin", "esbuild"),
+  const esbuild = esbuildCommand();
+  runStep(`bundle (esbuild, ${esbuild.how})`, esbuild.command, [
+    ...esbuild.args,
     path.join(REPO_ROOT, "src", "index.ts"),
     "--bundle",
     "--platform=node",
