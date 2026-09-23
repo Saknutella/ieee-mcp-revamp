@@ -1,12 +1,26 @@
 {
-  "name": "ieee-xplore-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for IEEE Xplore API - search and retrieve academic papers",
+  "name": "ieee-mcp",
+  "version": "2.0.0",
+  "description": "IEEE Xplore Metadata Search MCP server (stdio) delivering a single-file Windows x64 executable",
   "type": "module",
-  "main": "dist/index.js",
+  "private": true,
+  "main": "dist/ieee-mcp.exe",
+  "bin": {
+    "ieee-mcp": "dist/ieee-mcp.exe"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js"
+    "typecheck": "tsc --noEmit",
+    "bundle": "node scripts/bundle.mjs",
+    "sea": "node scripts/build-sea.mjs",
+    "build": "node scripts/build.mjs",
+    "mock-server": "node test/mock-ieee-server.mjs",
+    "test": "node test/run-all.mjs",
+    "test:e2e": "node test/e2e-mcp.mjs",
+    "test:unit": "node test/unit.mjs",
+    "checksums": "node scripts/checksums.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
@@ -14,6 +28,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6",
     "typescript": "^5.7.0"
   }
 }

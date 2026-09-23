@@ -1,573 +1,290 @@
 #!/usr/bin/env node
+/**
+ * ieee-mcp - IEEE Xplore Metadata Search MCP server (stdio transport).
+ *
+ * stdout carries MCP JSON-RPC framing and nothing else. Every diagnostic goes to
+ * stderr through src/logger.ts, which scrubs the API key. `console.*` is rerouted
+ * to stderr as a safety net, because the MCP SDK owns stdout.
+ */
+
+import process from "node:process";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
-// ── Constants ──────────────────────────────────────────────────────────────────
+import { getConfig, SERVER_NAME, SERVER_VERSION, describeConfig, type Config } from "./config.js";
+import { setLogLevel, log, registerSecret, redact } from "./logger.js";
+import { IeeeMcpError, toIeeeMcpError } from "./errors.js";
+import { DiskCache } from "./cache.js";
+import { IeeeClient } from "./ieeeClient.js";
+import { ResultStore } from "./resultStore.js";
+import { registerTools } from "./tools.js";
+import { ensureDir } from "./store.js";
 
-const API_BASE = "https://ieeexploreapi.ieee.org/api/v1/search/articles";
-const DOC_BASE = "https://ieeexploreapi.ieee.org/api/v1/search/document";
+let shuttingDown = false;
 
-const IEEE_API_KEY = process.env.IEEE_API_KEY;
-const IEEE_AUTH_TOKEN = process.env.IEEE_AUTH_TOKEN;
-
-const MAX_TEXT_LENGTH = 50_000;
-
-// ── Types ──────────────────────────────────────────────────────────────────────
-
-interface IEEEAuthor {
-  authorUrl?: string;
-  id?: number;
-  full_name?: string;
-  affiliation?: string;
-}
-
-interface IEEEArticle {
-  article_number?: string;
-  doi?: string;
-  title?: string;
-  abstract?: string;
-  publication_title?: string;
-  publication_year?: string;
-  publication_date?: string;
-  content_type?: string;
-  start_page?: string;
-  end_page?: string;
-  citing_paper_count?: number;
-  citing_patent_count?: number;
-  is_open_access?: boolean;
-  html_url?: string;
-  pdf_url?: string;
-  authors?: { authors: IEEEAuthor[] };
-  index_terms?: Record<string, { terms: string[] }>;
-  isbn?: string;
-  issn?: string;
-  publisher?: string;
-  conference_location?: string;
-  conference_dates?: string;
-  full_text?: string;
-}
-
-interface IEEESearchResponse {
-  total_records?: number;
-  articles?: IEEEArticle[];
-}
-
-// ── API Client ─────────────────────────────────────────────────────────────────
-
-async function ieeeRequest(
-  params: Record<string, string | number | boolean | undefined>
-): Promise<IEEESearchResponse> {
-  const url = new URL(API_BASE);
-  url.searchParams.set("apikey", IEEE_API_KEY!);
-
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  console.error(`[ieee-mcp] GET ${url.pathname}?${url.searchParams.toString().replace(IEEE_API_KEY!, "***")}`);
-
-  const res = await fetch(url.toString());
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`IEEE API auth error (${res.status}): Check your IEEE_API_KEY. ${body}`);
-    }
-    if (res.status === 429) {
-      throw new Error(
-        `IEEE API rate limit exceeded (429). The free tier allows ~200 calls/day. ${body}`
-      );
-    }
-    throw new Error(`IEEE API error ${res.status}: ${body}`);
-  }
-
-  return (await res.json()) as IEEESearchResponse;
-}
-
-async function ieeeFullTextRequest(articleNumber: string): Promise<string> {
-  const url = new URL(`${DOC_BASE}/${articleNumber}`);
-  url.searchParams.set("apikey", IEEE_API_KEY!);
-
-  const headers: Record<string, string> = {
-    Accept: "application/json",
+/** Route the console to stderr so nothing but MCP framing can reach stdout. */
+function routeConsoleToStderr(): void {
+  const toLog = (prefix: string) => (...args: unknown[]) => {
+    log.error(`${prefix}${args.map((arg) => redact(arg)).join(" ")}`);
   };
+  console.log = toLog("");
+  console.info = toLog("");
+  console.debug = toLog("[debug] ");
+  console.warn = toLog("[warn] ");
+}
 
-  if (IEEE_AUTH_TOKEN) {
-    headers["Authorization"] = `Bearer ${IEEE_AUTH_TOKEN}`;
-  }
-
-  console.error(`[ieee-mcp] GET full-text for article ${articleNumber}`);
-
-  const res = await fetch(url.toString(), { headers });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    if (res.status === 401 || res.status === 403) {
-      if (!IEEE_AUTH_TOKEN) {
-        throw new Error(
-          `Full text not available: this article may be paywalled. Set IEEE_AUTH_TOKEN env var for institutional access. (${res.status})`
-        );
+function flushStdout(): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      if (process.stdout.writableLength === 0) {
+        resolve();
+        return;
       }
-      throw new Error(`IEEE full-text auth error (${res.status}): ${body}`);
+      process.stdout.write("", () => resolve());
+    } catch {
+      resolve();
     }
-    if (res.status === 404) {
-      throw new Error(`Article ${articleNumber} not found.`);
-    }
-    throw new Error(`IEEE API error ${res.status}: ${body}`);
+  });
+}
+
+async function shutdown(server: McpServer | null, code: number): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.debug(`Shutting down with exit code ${code}.`);
+  try {
+    await server?.close();
+  } catch (error) {
+    log.debug(`Error while closing the MCP server: ${redact(error)}`);
+  }
+  await flushStdout();
+  process.exit(code);
+}
+
+/**
+ * Highest request id (or count of outstanding notifications) seen but not yet answered.
+ *
+ * A client may close stdin right after writing its last request; without this the
+ * process would exit while a tool call is still waiting on the network.
+ */
+class PendingRequests {
+  private readonly ids = new Set<string | number>();
+
+  /** Incoming JSON-RPC request: has both `method` and `id`. */
+  track(message: unknown): void {
+    const id = requestId(message);
+    if (id !== null) this.ids.add(id);
   }
 
-  const data = (await res.json()) as IEEEArticle;
+  /** Outgoing JSON-RPC response: has an `id` and no `method`. */
+  settle(message: unknown): void {
+    const id = responseId(message);
+    if (id !== null) this.ids.delete(id);
+  }
 
-  if (!data.full_text) {
-    throw new Error(
-      `No full text available for article ${articleNumber}. It may be paywalled (set IEEE_AUTH_TOKEN for institutional access) or not available via API.`
+  get size(): number {
+    return this.ids.size;
+  }
+
+  async drain(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.ids.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (this.ids.size > 0) {
+      log.warn(`Timed out after ${timeoutMs}ms waiting for ${this.ids.size} in-flight request(s).`);
+      return false;
+    }
+    return true;
+  }
+}
+
+function requestId(message: unknown): string | number | null {
+  if (message === null || typeof message !== "object") return null;
+  const record = message as Record<string, unknown>;
+  if (!("method" in record)) return null; // outgoing response, not an incoming request
+  const id = record.id;
+  return typeof id === "string" || typeof id === "number" ? id : null;
+}
+
+function responseId(message: unknown): string | number | null {
+  if (message === null || typeof message !== "object") return null;
+  const record = message as Record<string, unknown>;
+  if ("method" in record) return null; // outgoing request/notification, not a response
+  const id = record.id;
+  return typeof id === "string" || typeof id === "number" ? id : null;
+}
+
+/** Diagnostic mode: everything on stderr so stdout stays reserved for MCP. */
+function printSelfTest(config: Config): void {
+  const report = {
+    server: `${SERVER_NAME} ${SERVER_VERSION}`,
+    exec_path: process.execPath,
+    platform: `${process.platform}-${process.arch}`,
+    node: process.version,
+    argv: process.argv.slice(2),
+    config: describeConfig(config),
+    config_warnings: config.warnings,
+  };
+  process.stderr.write(`${JSON.stringify(report, null, 2)}\n`);
+}
+
+const HELP_TEXT = [
+  `${SERVER_NAME} ${SERVER_VERSION} - IEEE Xplore Metadata Search MCP server (stdio)`,
+  "",
+  "This process speaks MCP JSON-RPC over stdin/stdout. It is normally started by an MCP",
+  "client, not from an interactive shell.",
+  "",
+  "Environment:",
+  "  IEEE_API_KEY            required (unless IEEE_API_KEY_FILE is used)",
+  "  IEEE_API_KEY_FILE       read the key from a UTF-8 file instead",
+  "  IEEE_MCP_STATE_DIR      where the usage ledger, cache and result sets live",
+  "  IEEE_OUTPUT_DIR         base directory for exports",
+  "  IEEE_MAX_RPS            requests/second ceiling (default 8, documented max 10)",
+  "  IEEE_DAILY_BUDGET       local daily call budget (default 200)",
+  "  IEEE_BUDGET_WINDOW      both | utc-day | local-day | rolling-24h (default both)",
+  "  IEEE_MAX_RETRIES        retry attempts for transient failures (default 2)",
+  "  IEEE_TIMEOUT_MS         per-request timeout in ms (default 20000)",
+  "  IEEE_CACHE_TTL_SECONDS  response cache TTL, 0 disables (default 86400)",
+  "  IEEE_CACHE_MAX_ENTRIES  cache entry cap (default 500)",
+  "  IEEE_RESULT_TTL_SECONDS stored result-set TTL (default 21600)",
+  "  IEEE_LOG_LEVEL          silent | error | warn | info | debug (default info)",
+  "  IEEE_API_BASE           override the endpoint (testing/mock servers only)",
+  "",
+  "Flags:",
+  "  --version    print the version on stderr and exit",
+  "  --self-test  print the resolved configuration (key fingerprinted) on stderr and exit",
+  "  --help       print this text on stderr and exit",
+  "",
+].join("\n");
+
+async function main(): Promise<void> {
+  // In a Node SEA, argv[0] is the executable and argv[1] is not guaranteed to be
+  // absent, so scan everything after argv[0] for flags.
+  const argv = process.argv.slice(1);
+
+  let config: Config;
+  try {
+    config = getConfig();
+  } catch (error) {
+    const normalized = toIeeeMcpError(error);
+    process.stderr.write(`${SERVER_NAME}: fatal configuration error: ${normalized.message}\n`);
+    process.exit(2);
+    return;
+  }
+
+  setLogLevel(config.logLevel);
+  if (config.hasApiKey) registerSecret(config.apiKey);
+  routeConsoleToStderr();
+
+  if (argv.includes("--version") || argv.includes("-v")) {
+    process.stderr.write(`${SERVER_NAME} ${SERVER_VERSION}\n`);
+    process.exit(0);
+    return;
+  }
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stderr.write(HELP_TEXT);
+    process.exit(0);
+    return;
+  }
+  if (argv.includes("--self-test")) {
+    printSelfTest(config);
+    process.exit(0);
+    return;
+  }
+
+  log.info(`Starting ${SERVER_NAME} ${SERVER_VERSION} (pid ${process.pid}).`);
+  log.info(
+    `Config: api_base=${config.apiBase} rps=${config.maxRps} budget=${config.dailyBudget}/${config.budgetWindow} ` +
+      `retries=${config.maxRetries} timeout=${config.timeoutMs}ms cache_ttl=${config.cacheTtlSeconds}s ` +
+      `state_dir=${config.stateDir} log_level=${config.logLevel}`
+  );
+  log.info(`API key source: ${config.apiKeySource}, fingerprint sha256[0:12]=${config.keyFingerprint}`);
+  for (const warning of config.warnings) log.warn(warning);
+
+  if (!config.apiBaseIsDefault) {
+    log.warn(
+      `IEEE_API_BASE is overridden to ${config.apiBase}. Intended for offline testing against a mock server; ` +
+        "real queries should use the official endpoint."
+    );
+  }
+  if (!config.hasApiKey) {
+    log.error(
+      "No IEEE API key configured. The server still answers initialize/tools/list, but every search tool " +
+        "returns CONFIG_ERROR until IEEE_API_KEY (or IEEE_API_KEY_FILE) is set."
     );
   }
 
-  let text = data.full_text;
-  if (text.length > MAX_TEXT_LENGTH) {
-    text = text.substring(0, MAX_TEXT_LENGTH) + `\n\n--- TRUNCATED at ${MAX_TEXT_LENGTH} characters ---`;
+  try {
+    ensureDir(config.stateDir);
+  } catch (error) {
+    log.warn(`State directory ${config.stateDir} is not writable: ${redact(error)}`);
   }
 
-  return text;
-}
+  const cache = new DiskCache(config);
+  const client = new IeeeClient(config, cache);
+  const results = new ResultStore(config);
 
-// ── Formatters ─────────────────────────────────────────────────────────────────
-
-function formatArticle(article: IEEEArticle, verbose = false): string {
-  const lines: string[] = [];
-
-  lines.push(`**${article.title ?? "Untitled"}**`);
-
-  const authors = article.authors?.authors;
-  if (authors?.length) {
-    const names = authors.map((a) => a.full_name).filter(Boolean);
-    lines.push(`Authors: ${names.join(", ")}`);
-    if (verbose) {
-      for (const a of authors) {
-        if (a.affiliation) {
-          lines.push(`  - ${a.full_name}: ${a.affiliation}`);
-        }
-      }
-    }
-  }
-
-  if (article.publication_title) {
-    lines.push(`Publication: ${article.publication_title}`);
-  }
-  if (article.publication_year) {
-    lines.push(`Year: ${article.publication_year}`);
-  }
-  if (article.content_type) {
-    lines.push(`Type: ${article.content_type}`);
-  }
-  if (article.doi) {
-    lines.push(`DOI: ${article.doi}`);
-  }
-  if (article.article_number) {
-    lines.push(`Article #: ${article.article_number}`);
-  }
-
-  if (article.start_page && article.end_page) {
-    lines.push(`Pages: ${article.start_page}-${article.end_page}`);
-  }
-
-  if (article.is_open_access) {
-    lines.push(`Open Access: Yes`);
-  }
-
-  if (article.citing_paper_count !== undefined) {
-    lines.push(`Citations: ${article.citing_paper_count} papers, ${article.citing_patent_count ?? 0} patents`);
-  }
-
-  if (article.abstract) {
-    lines.push(`\nAbstract: ${article.abstract}`);
-  }
-
-  if (verbose && article.index_terms) {
-    const allTerms: string[] = [];
-    for (const [category, data] of Object.entries(article.index_terms)) {
-      if (data?.terms?.length) {
-        allTerms.push(`${category}: ${data.terms.join(", ")}`);
-      }
-    }
-    if (allTerms.length) {
-      lines.push(`\nKeywords:\n  ${allTerms.join("\n  ")}`);
-    }
-  }
-
-  if (article.html_url) {
-    lines.push(`URL: ${article.html_url}`);
-  }
-  if (article.pdf_url) {
-    lines.push(`PDF: ${article.pdf_url}`);
-  }
-
-  return lines.join("\n");
-}
-
-function formatSearchResults(response: IEEESearchResponse, startRecord: number): string {
-  const total = response.total_records ?? 0;
-  const articles = response.articles ?? [];
-
-  if (articles.length === 0) {
-    return `No results found. (Total: ${total})`;
-  }
-
-  const lines: string[] = [];
-  lines.push(`Found ${total} results (showing ${startRecord}-${startRecord + articles.length - 1}):\n`);
-
-  for (let i = 0; i < articles.length; i++) {
-    lines.push(`[${startRecord + i}] ${formatArticle(articles[i])}`);
-    if (i < articles.length - 1) {
-      lines.push("\n---\n");
-    }
-  }
-
-  if (startRecord + articles.length < total) {
-    lines.push(
-      `\n---\nMore results available. Use start_record=${startRecord + articles.length} to see next page.`
-    );
-  }
-
-  return lines.join("\n");
-}
-
-// ── MCP Server ─────────────────────────────────────────────────────────────────
-
-const server = new McpServer({
-  name: "ieee-xplore",
-  version: "1.0.0",
-});
-
-// Tool 1: search_papers
-server.registerTool(
-  "search_papers",
-  {
-    description:
-      "Search IEEE Xplore for papers. Supports full-text search with Boolean operators (AND, OR, NOT) and multiple filters. Returns metadata, abstracts, and links.",
-    inputSchema: {
-      querytext: z
-        .string()
-        .optional()
-        .describe("Full-text search query. Supports AND, OR, NOT operators."),
-      author: z.string().optional().describe("Filter by author name"),
-      article_title: z.string().optional().describe("Search within article titles"),
-      abstract: z.string().optional().describe("Search within abstracts"),
-      affiliation: z.string().optional().describe("Filter by author affiliation"),
-      index_terms: z.string().optional().describe("Search by index terms / keywords"),
-      doi: z.string().optional().describe("Search by DOI"),
-      publication_title: z.string().optional().describe("Filter by publication / journal / conference name"),
-      publication_year: z.string().optional().describe("Filter by publication year (e.g. '2023')"),
-      start_year: z.string().optional().describe("Start of year range (e.g. '2020')"),
-      end_year: z.string().optional().describe("End of year range (e.g. '2024')"),
-      content_type: z
-        .string()
-        .optional()
-        .describe("Filter by content type: Conferences, Journals, Early Access, Standards, Books, Courses"),
-      open_access: z.boolean().optional().describe("Filter for open access articles only"),
-      max_records: z
-        .number()
-        .min(1)
-        .max(200)
-        .optional()
-        .describe("Number of results to return (default 25, max 200)"),
-      start_record: z.number().min(1).optional().describe("Starting record number for pagination (default 1)"),
-      sort_field: z
-        .string()
-        .optional()
-        .describe("Sort by: article_title, article_number, author, publication_title, publication_year"),
-      sort_order: z.enum(["asc", "desc"]).optional().describe("Sort order: asc or desc"),
-    },
-  },
-  async (args) => {
-    const params: Record<string, string | number | boolean | undefined> = {};
-
-    if (args.querytext) params.querytext = args.querytext;
-    if (args.author) params.author = args.author;
-    if (args.article_title) params.article_title = args.article_title;
-    if (args.abstract) params.abstract = args.abstract;
-    if (args.affiliation) params.affiliation = args.affiliation;
-    if (args.index_terms) params.index_terms = args.index_terms;
-    if (args.doi) params.doi = args.doi;
-    if (args.publication_title) params.publication_title = args.publication_title;
-    if (args.publication_year) params.publication_year = args.publication_year;
-    if (args.start_year) params.start_year = args.start_year;
-    if (args.end_year) params.end_year = args.end_year;
-    if (args.content_type) params.content_type = args.content_type;
-    if (args.open_access) params.open_access = true;
-    if (args.max_records) params.max_records = args.max_records;
-    if (args.start_record) params.start_record = args.start_record;
-    if (args.sort_field) params.sort_field = args.sort_field;
-    if (args.sort_order) params.sort_order = args.sort_order;
-
-    try {
-      const response = await ieeeRequest(params);
-      const startRecord = args.start_record ?? 1;
-      return {
-        content: [{ type: "text" as const, text: formatSearchResults(response, startRecord) }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 2: get_paper_details
-server.registerTool(
-  "get_paper_details",
-  {
-    description:
-      "Get detailed metadata for a single IEEE paper by article number or DOI. Returns full author affiliations, abstract, keywords, citation counts, and URLs.",
-    inputSchema: {
-      article_number: z.string().optional().describe("IEEE article number"),
-      doi: z.string().optional().describe("DOI of the paper"),
-    },
-  },
-  async (args) => {
-    if (!args.article_number && !args.doi) {
-      return {
-        content: [{ type: "text" as const, text: "Error: Provide either article_number or doi." }],
-        isError: true,
-      };
-    }
-
-    const params: Record<string, string | number | boolean | undefined> = {
-      max_records: 1,
-    };
-    if (args.article_number) params.article_number = args.article_number;
-    if (args.doi) params.doi = args.doi;
-
-    try {
-      const response = await ieeeRequest(params);
-      const articles = response.articles ?? [];
-
-      if (articles.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `No paper found for ${args.article_number ? `article #${args.article_number}` : `DOI ${args.doi}`}.`,
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [{ type: "text" as const, text: formatArticle(articles[0], true) }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 3: get_paper_citations
-server.registerTool(
-  "get_paper_citations",
-  {
-    description: "Get citation counts (papers and patents) for an IEEE paper.",
-    inputSchema: {
-      article_number: z.string().optional().describe("IEEE article number"),
-      doi: z.string().optional().describe("DOI of the paper"),
-    },
-  },
-  async (args) => {
-    if (!args.article_number && !args.doi) {
-      return {
-        content: [{ type: "text" as const, text: "Error: Provide either article_number or doi." }],
-        isError: true,
-      };
-    }
-
-    const params: Record<string, string | number | boolean | undefined> = {
-      max_records: 1,
-    };
-    if (args.article_number) params.article_number = args.article_number;
-    if (args.doi) params.doi = args.doi;
-
-    try {
-      const response = await ieeeRequest(params);
-      const articles = response.articles ?? [];
-
-      if (articles.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `No paper found for ${args.article_number ? `article #${args.article_number}` : `DOI ${args.doi}`}.`,
-            },
-          ],
-        };
-      }
-
-      const article = articles[0];
-      const lines = [
-        `**${article.title ?? "Untitled"}**`,
-        `Citing papers: ${article.citing_paper_count ?? 0}`,
-        `Citing patents: ${article.citing_patent_count ?? 0}`,
-      ];
-
-      return {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 4: get_full_text
-server.registerTool(
-  "get_full_text",
-  {
-    description:
-      "Retrieve the full text of an IEEE paper by article number. Works for Open Access articles. For paywalled articles, set IEEE_AUTH_TOKEN env var. Output is truncated at ~50K characters.",
-    inputSchema: {
-      article_number: z.string().describe("IEEE article number"),
-    },
-  },
-  async (args) => {
-    try {
-      const text = await ieeeFullTextRequest(args.article_number);
-      return {
-        content: [{ type: "text" as const, text }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 5: search_by_author
-server.registerTool(
-  "search_by_author",
-  {
-    description:
-      "Search IEEE Xplore for papers by a specific author. Convenience wrapper around search_papers with author as the primary filter.",
-    inputSchema: {
-      author: z.string().describe("Author name to search for"),
-      start_year: z.string().optional().describe("Start of year range"),
-      end_year: z.string().optional().describe("End of year range"),
-      content_type: z
-        .string()
-        .optional()
-        .describe("Filter by content type: Conferences, Journals, Early Access, Standards, Books, Courses"),
-      publication_title: z.string().optional().describe("Filter by publication / journal / conference name"),
-      max_records: z.number().min(1).max(200).optional().describe("Number of results (default 25, max 200)"),
-      start_record: z.number().min(1).optional().describe("Starting record for pagination"),
-    },
-  },
-  async (args) => {
-    const params: Record<string, string | number | boolean | undefined> = {
-      author: args.author,
-    };
-
-    if (args.start_year) params.start_year = args.start_year;
-    if (args.end_year) params.end_year = args.end_year;
-    if (args.content_type) params.content_type = args.content_type;
-    if (args.publication_title) params.publication_title = args.publication_title;
-    if (args.max_records) params.max_records = args.max_records;
-    if (args.start_record) params.start_record = args.start_record;
-
-    try {
-      const response = await ieeeRequest(params);
-      const startRecord = args.start_record ?? 1;
-      return {
-        content: [{ type: "text" as const, text: formatSearchResults(response, startRecord) }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool 6: search_by_publication
-server.registerTool(
-  "search_by_publication",
-  {
-    description:
-      "Search IEEE Xplore for papers in a specific publication (journal/conference). Convenience wrapper around search_papers with publication_title as the primary filter.",
-    inputSchema: {
-      publication_title: z.string().describe("Publication, journal, or conference name"),
-      querytext: z.string().optional().describe("Additional search query within the publication"),
-      start_year: z.string().optional().describe("Start of year range"),
-      end_year: z.string().optional().describe("End of year range"),
-      max_records: z.number().min(1).max(200).optional().describe("Number of results (default 25, max 200)"),
-      start_record: z.number().min(1).optional().describe("Starting record for pagination"),
-      sort_field: z.string().optional().describe("Sort by: article_title, publication_year, etc."),
-      sort_order: z.enum(["asc", "desc"]).optional().describe("Sort order: asc or desc"),
-    },
-  },
-  async (args) => {
-    const params: Record<string, string | number | boolean | undefined> = {
-      publication_title: args.publication_title,
-    };
-
-    if (args.querytext) params.querytext = args.querytext;
-    if (args.start_year) params.start_year = args.start_year;
-    if (args.end_year) params.end_year = args.end_year;
-    if (args.max_records) params.max_records = args.max_records;
-    if (args.start_record) params.start_record = args.start_record;
-    if (args.sort_field) params.sort_field = args.sort_field;
-    if (args.sort_order) params.sort_order = args.sort_order;
-
-    try {
-      const response = await ieeeRequest(params);
-      const startRecord = args.start_record ?? 1;
-      return {
-        content: [{ type: "text" as const, text: formatSearchResults(response, startRecord) }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// ── Main ───────────────────────────────────────────────────────────────────────
-
-async function main() {
-  if (!IEEE_API_KEY) {
-    console.error(
-      "[ieee-mcp] ERROR: IEEE_API_KEY environment variable is required.\n" +
-        "Register at https://developer.ieee.org to get a free API key."
-    );
-    process.exit(1);
-  }
-
-  console.error("[ieee-mcp] Starting IEEE Xplore MCP server...");
-  if (IEEE_AUTH_TOKEN) {
-    console.error("[ieee-mcp] IEEE_AUTH_TOKEN set - paywalled full-text access enabled.");
-  }
+  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
+  registerTools(server, {
+    config,
+    client,
+    cache,
+    results,
+    searchContext: { config, client, results },
+  });
 
   const transport = new StdioServerTransport();
+
   await server.connect(transport);
-  console.error("[ieee-mcp] Server running on stdio.");
+
+  // `connect` installs the transport callbacks, so wrap them afterwards to count
+  // in-flight requests. Notifications carry no id and are already fire-and-forget.
+  const pending = new PendingRequests();
+  const innerOnMessage = transport.onmessage;
+  transport.onmessage = (message: JSONRPCMessage): void => {
+    pending.track(message);
+    innerOnMessage?.(message);
+  };
+  const innerSend = transport.send.bind(transport);
+  transport.send = async (message: JSONRPCMessage): Promise<void> => {
+    await innerSend(message);
+    pending.settle(message);
+  };
+
+  log.info("Server running on stdio. Close stdin (or send SIGTERM) to stop.");
+
+  // The SDK does not react to stdin EOF. An MCP client may close stdin, and the
+  // end-to-end tests feed every request at once and then close the pipe, so drain
+  // outstanding requests and exit cleanly instead of hanging or truncating output.
+  const graceMs = config.shutdownGraceMs;
+  const onInputClosed = (): void => {
+    log.debug("stdin closed; draining in-flight requests before exit.");
+    void pending.drain(graceMs).then(() => shutdown(server, 0));
+  };
+  process.stdin.on("end", onInputClosed);
+  process.stdin.on("close", onInputClosed);
 }
 
-main().catch((error) => {
-  console.error("[ieee-mcp] Fatal error:", error);
+process.on("uncaughtException", (error) => {
+  const normalized = error instanceof IeeeMcpError ? error : toIeeeMcpError(error);
+  process.stderr.write(`${SERVER_NAME}: uncaught exception: ${normalized.message}\n`);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`${SERVER_NAME}: unhandled rejection: ${redact(reason)}\n`);
+});
+
+process.on("SIGINT", () => {
+  void shutdown(null, 0);
+});
+process.on("SIGTERM", () => {
+  void shutdown(null, 0);
+});
+
+void main().catch((error) => {
+  process.stderr.write(`${SERVER_NAME}: fatal error: ${redact(error)}\n`);
   process.exit(1);
 });
