@@ -12,13 +12,17 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { ARTIFACT_NAME, TARGET } from "./target.mjs";
+
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const BUILD_DIR = path.join(REPO_ROOT, "build");
 export const DIST_DIR = path.join(REPO_ROOT, "dist");
 export const BUNDLE_FILE = path.join(BUILD_DIR, "bundle.cjs");
 export const SEA_CONFIG_FILE = path.join(BUILD_DIR, "sea-config.json");
 export const SEA_BLOB_FILE = path.join(BUILD_DIR, "ieee-mcp.blob");
-export const EXE_FILE = path.join(DIST_DIR, "ieee-mcp.exe");
+// Named per target: ieee-mcp.exe on Windows, ieee-mcp-linux-amd64 on Linux.
+export const EXE_FILE = path.join(DIST_DIR, ARTIFACT_NAME);
+export { ARTIFACT_NAME, TARGET };
 
 export function runStep(label, command, args, options = {}) {
   process.stdout.write(`\n>>> ${label}\n    ${path.basename(command)} ${args.join(" ")}\n`);

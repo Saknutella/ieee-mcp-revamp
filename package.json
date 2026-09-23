@@ -1,13 +1,9 @@
 {
   "name": "ieee-mcp",
   "version": "2.0.0",
-  "description": "IEEE Xplore Metadata Search MCP server (stdio) delivering a single-file Windows x64 executable",
+  "description": "IEEE Xplore Metadata Search MCP server (stdio) delivered as a single-file Windows x64 or Linux amd64 executable",
   "type": "module",
   "private": true,
-  "main": "dist/ieee-mcp.exe",
-  "bin": {
-    "ieee-mcp": "dist/ieee-mcp.exe"
-  },
   "engines": {
     "node": ">=20"
   },
@@ -18,8 +14,6 @@
     "build": "node scripts/build.mjs",
     "mock-server": "node test/mock-ieee-server.mjs",
     "test": "node test/run-all.mjs",
-    "test:e2e": "node test/e2e-mcp.mjs",
-    "test:unit": "node test/unit.mjs",
     "checksums": "node scripts/checksums.mjs"
   },
   "dependencies": {

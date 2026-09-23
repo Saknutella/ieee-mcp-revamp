@@ -4,10 +4,12 @@ build/
 *.js.map
 
 # Build artifacts: the executable is delivered alongside the repo, not committed
-# as a 91 MB binary blob. Rebuild reproducibly with `node scripts/build.mjs`.
+# as a ~90 MB binary blob. Rebuild reproducibly with `node scripts/build.mjs`.
 dist/*.exe
 dist/*.blob
 dist/*.log
+# Linux target artifact (no file extension, so it needs its own rule).
+dist/ieee-mcp-linux-amd64
 
 # Local runtime state (usage ledger, response cache, stored result sets)
 .ieee-mcp/

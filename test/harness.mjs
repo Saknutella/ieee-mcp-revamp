@@ -12,8 +12,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { ARTIFACT_NAME } from "../scripts/target.mjs";
+
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const EXE_PATH = path.join(REPO_ROOT, "dist", "ieee-mcp.exe");
+// Named by the build target, so the suite always exercises the artifact this
+// platform actually produces: ieee-mcp.exe on Windows, ieee-mcp-linux-amd64 on Linux.
+export const EXE_PATH = path.join(REPO_ROOT, "dist", ARTIFACT_NAME);
 export const BUNDLE_PATH = path.join(REPO_ROOT, "build", "bundle.cjs");
 
 let runCounter = 0;
@@ -239,7 +243,7 @@ export function paramKeys(request, { includeApiKey = false } = {}) {
 
 /**
  * Which artifact the suite exercises.
- *   IEEE_TEST_TARGET=exe    (default) the packaged dist/ieee-mcp.exe
+ *   IEEE_TEST_TARGET=exe    (default) the packaged executable in dist/
  *   IEEE_TEST_TARGET=bundle run the esbuild bundle with the local Node runtime
  */
 export function defaultTarget() {

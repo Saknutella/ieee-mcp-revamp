@@ -5,7 +5,11 @@
  *
  * Steps: clean -> typecheck -> bundle -> SEA blob -> executable -> checksums.
  * Requires only a local Node.js (>= 20) and `npm install` in this directory.
- * The produced dist/ieee-mcp.exe needs no Node.js, npm or npx at run time.
+ * The produced executable in dist/ needs no Node.js, npm or npx at run time.
+ *
+ * The build is native: running it on Windows produces dist/ieee-mcp.exe, running
+ * it on Linux produces dist/ieee-mcp-linux-amd64. Cross-building is refused, see
+ * scripts/target.mjs.
  */
 
 import fs from "node:fs";
@@ -15,6 +19,7 @@ import process from "node:process";
 import { BUILD_DIR, DIST_DIR, bundle, typecheck } from "./bundle.mjs";
 import { buildSea } from "./build-sea.mjs";
 import { writeChecksums } from "./checksums.mjs";
+import { TARGET } from "./target.mjs";
 
 function clean() {
   for (const dir of [BUILD_DIR, DIST_DIR]) {
@@ -25,7 +30,7 @@ function clean() {
 
 async function main() {
   const started = Date.now();
-  process.stdout.write("ieee-mcp build\n");
+  process.stdout.write(`ieee-mcp build (target ${TARGET.id}, host ${TARGET.host})\n`);
 
   clean();
   typecheck();
@@ -41,7 +46,8 @@ async function main() {
   }
   process.stdout.write(`checksums: ${sumsFile}\n`);
   process.stdout.write(
-    `useCodeCache=${sea.useCodeCache}, byte-reproducible=${sea.reproducible}, sea blob ${sea.blobSize} bytes\n`
+    `target=${sea.target}, useCodeCache=${sea.useCodeCache}, byte-reproducible=${sea.reproducible}, ` +
+      `sea blob ${sea.blobSize} bytes\n`
   );
   process.stdout.write(
     sea.reproducible

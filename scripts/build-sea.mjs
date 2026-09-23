@@ -1,13 +1,15 @@
 /**
- * Step 2 of the build: turn the bundle into a single-file Windows executable
- * using Node's Single Executable Application (SEA) support.
+ * Step 2 of the build: turn the bundle into a single-file executable using
+ * Node's Single Executable Application (SEA) support.
  *
  *   1. emit the SEA preparation blob
- *   2. copy the running node.exe
- *   3. strip its Authenticode signature (required before injecting, and a signed
- *      PE whose hash no longer matches is rejected by some Windows policies)
+ *   2. copy the running Node runtime (node.exe on Windows, node on Linux)
+ *   3. on Windows, strip its Authenticode signature (required before injecting,
+ *      and a signed PE whose hash no longer matches is rejected by some Windows
+ *      policies)
  *   4. inject the blob with postject (pure JS, no child-process pipes)
- *   5. smoke-test the result
+ *   5. on Linux, mark the result executable
+ *   6. smoke-test the result
  *
  * The result needs no Node.js installation on the target machine: it *is* the
  * Node runtime plus the bundled server.
@@ -21,9 +23,30 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { BUILD_DIR, BUNDLE_FILE, DIST_DIR, EXE_FILE, REPO_ROOT, SEA_BLOB_FILE, SEA_CONFIG_FILE, runStep } from "./bundle.mjs";
+import { ARTIFACT_NAME, TARGET } from "./target.mjs";
 
 const require = createRequire(import.meta.url);
 const SENTINEL_FUSE = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
+
+/**
+ * postject flips the SEA sentinel fuse in the host binary, and the fuse string
+ * has to be present for that to work. Official Node builds for every supported
+ * target ship it, but a distro-patched or custom Node might not, so this is
+ * checked up front to turn an opaque postject failure into a clear message.
+ */
+export function assertHostRuntimeHasSeaFuse(file = process.execPath) {
+  const buffer = fs.readFileSync(file);
+  if (!buffer.includes(SENTINEL_FUSE)) {
+    throw new Error(
+      `${path.basename(file)} does not contain the SEA sentinel fuse (${SENTINEL_FUSE}). ` +
+        `Single-executable builds need an unpatched official Node build for ${TARGET.id}.`
+    );
+  }
+  if (TARGET.format === "elf" && !buffer.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+    throw new Error(`${path.basename(file)} is not an ELF image; it cannot host a ${TARGET.id} build.`);
+  }
+  return { bytes: buffer.length, format: TARGET.format };
+}
 
 /**
  * Windows refuses to load a PE whose Authenticode hash no longer matches, and
@@ -103,20 +126,32 @@ export function buildBlob(useCodeCache) {
 }
 
 export async function injectBlob() {
+  const host = assertHostRuntimeHasSeaFuse();
+  process.stdout.write(`    host runtime: ${process.execPath} (${host.bytes} bytes, ${host.format})\n`);
+
   fs.mkdirSync(DIST_DIR, { recursive: true });
   fs.copyFileSync(process.execPath, EXE_FILE);
 
-  const signature = stripAuthenticodeSignature(EXE_FILE);
-  process.stdout.write(
-    signature.stripped
-      ? `    stripped Authenticode signature (${signature.certificateSize} bytes)\n`
-      : `    no signature to strip: ${signature.reason}\n`
-  );
+  // Only a PE image carries an Authenticode certificate table.
+  if (TARGET.format === "pe") {
+    const signature = stripAuthenticodeSignature(EXE_FILE);
+    process.stdout.write(
+      signature.stripped
+        ? `    stripped Authenticode signature (${signature.certificateSize} bytes)\n`
+        : `    no signature to strip: ${signature.reason}\n`
+    );
+  }
 
   const postject = require("postject");
   await postject.inject(EXE_FILE, "NODE_SEA_BLOB", fs.readFileSync(SEA_BLOB_FILE), {
     sentinelFuse: SENTINEL_FUSE,
   });
+
+  // postject rewrites the file; restore the executable bit afterwards.
+  if (TARGET.needsExecBit) {
+    fs.chmodSync(EXE_FILE, 0o755);
+    process.stdout.write(`    chmod 0755 ${ARTIFACT_NAME}\n`);
+  }
   return fs.statSync(EXE_FILE).size;
 }
 
@@ -175,13 +210,13 @@ export async function buildSea(options = {}) {
   }
   const exeSize = await injectBlob();
   const report = smokeTest();
-  return { blobSize, exeSize, useCodeCache, reproducible: !useCodeCache, report };
+  return { target: TARGET.id, blobSize, exeSize, useCodeCache, reproducible: !useCodeCache, report };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const result = await buildSea();
   process.stdout.write(
-    `\nSEA executable: ${EXE_FILE}\n  blob ${result.blobSize} bytes, exe ${result.exeSize} bytes, ` +
+    `\nSEA executable (${result.target}): ${EXE_FILE}\n  blob ${result.blobSize} bytes, exe ${result.exeSize} bytes, ` +
       `useCodeCache=${result.useCodeCache}, reproducible=${result.reproducible}\n`
   );
 }

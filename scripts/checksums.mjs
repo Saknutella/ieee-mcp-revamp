@@ -13,6 +13,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { BUNDLE_FILE, DIST_DIR, EXE_FILE, REPO_ROOT, SEA_BLOB_FILE } from "./bundle.mjs";
+import { ARTIFACT_NAME, TARGET } from "./target.mjs";
 
 export function sha256File(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
@@ -40,6 +41,8 @@ export function writeChecksums() {
 
   const info = {
     generated_at: new Date().toISOString(),
+    target: TARGET.id,
+    artifact: ARTIFACT_NAME,
     node: process.version,
     v8: process.versions.v8,
     platform: `${process.platform}-${process.arch}`,

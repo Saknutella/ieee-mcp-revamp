@@ -46,7 +46,7 @@ export async function run() {
       report = null;
     }
     reporter.check("--self-test emits parsable JSON on stderr", report !== null, selfTest.stderr.slice(0, 300));
-    reporter.equal("--self-test reports the platform", report?.platform, "win32-x64");
+    reporter.equal("--self-test reports the platform", report?.platform, `${process.platform}-${process.arch}`);
     reporter.check("--self-test resolves exec_path to the server binary", typeof report?.exec_path === "string" && report.exec_path.length > 0, report?.exec_path);
     reporter.equal("--self-test marks the key as present", report?.config?.api_key_present, true);
     reporter.check(
