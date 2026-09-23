@@ -1,5 +1,34 @@
+# Dependencies and build outputs
 node_modules/
-dist/
+build/
 *.js.map
+
+# Build artifacts: the executable is delivered alongside the repo, not committed
+# as a 91 MB binary blob. Rebuild reproducibly with `node scripts/build.mjs`.
+dist/*.exe
+dist/*.blob
+dist/*.log
+
+# Local runtime state (usage ledger, response cache, stored result sets)
+.ieee-mcp/
+
+# Test scratch space
+.tmp/
+
+# Package manager caches kept inside the workspace
+.npm-cache/
+.npm/
+
+# Secrets: never commit a real API key
 .env
+.env.*
+!.env.example
 ieee-key.txt
+.ieee-key.local
+keys/
+*.key
+
+# Editor / OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
