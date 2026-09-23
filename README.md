@@ -125,6 +125,30 @@ Get-Content .\dist\SHA256SUMS.txt
 - **不要**在 `command` 里写 `node` / `npm` / `npx`，也不需要 `args`；
 - 修改客户端配置后需重启该客户端。
 
+#### 需要代理时
+
+IEEE 接口在国内常需代理。EXE 内置的 Node 运行时支持从环境变量读取代理，
+在客户端 `env` 中追加即可（`NODE_USE_ENV_PROXY=1` 是 Node 24 开启代理支持所需的开关）：
+
+```json
+"env": {
+  "IEEE_API_KEY": "<key>",
+  "NODE_USE_ENV_PROXY": "1",
+  "HTTPS_PROXY": "http://127.0.0.1:7890",
+  "NO_PROXY": "localhost,127.0.0.1"
+}
+```
+
+验证连通性（不需要真实 key，返回 `HTTP 403 Developer Inactive` 即说明网络可达）：
+
+```powershell
+.\dist\ieee-mcp.exe --self-test
+curl.exe --proxy http://127.0.0.1:7890 "https://ieeexploreapi.ieee.org/api/v1/search/articles?querytext=radar&apikey=x"
+```
+
+> 注意：IEEE 对**无效/未激活**的 key 返回的是 **HTTP 403 `Developer Inactive`**（而不是 401）。
+> 本服务遇到 403 会明确指出这一点，并且**不会重试**。
+
 ---
 
 ## 工具清单

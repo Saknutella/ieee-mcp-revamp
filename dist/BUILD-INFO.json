@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-09-23T03:35:13.589Z",
+  "node": "v24.12.0",
+  "v8": "13.6.233.17-node.37",
+  "platform": "win32-x64",
+  "esbuild": "0.28.2",
+  "postject": "1.0.0-alpha.6",
+  "typescript": "5.9.3",
+  "modelcontextprotocol/sdk": "1.26.0",
+  "zod": "3.25.76",
+  "artifacts": [
+    {
+      "path": "dist/ieee-mcp.exe",
+      "bytes": 91146752,
+      "sha256": "ec9a0a9180d8e793d5e41974a5574e78971c6210911b700e325a1355eeea4cf6"
+    },
+    {
+      "path": "build/bundle.cjs",
+      "bytes": 831377,
+      "sha256": "7354907e4c45f8f66fc680e989ea0b9e7e65f3dc12a0914e10333aef9b991e91"
+    },
+    {
+      "path": "build/ieee-mcp.blob",
+      "bytes": 1084290,
+      "sha256": "54911a487aad982e87a50a92adfd3c69c8bc911bdaf9e583fa6bf76228f75a35"
+    }
+  ]
+}

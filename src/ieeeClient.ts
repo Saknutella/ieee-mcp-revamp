@@ -84,6 +84,17 @@ interface ApiErrorShape {
   apiMessage: string | null;
 }
 
+/** Pull readable text out of an HTML gateway page (e.g. "<h1>Developer Inactive</h1>"). */
+function htmlToText(html: string): string | null {
+  const matches = [...html.matchAll(/<(h1|h2|title|p)[^>]*>([\s\S]*?)<\/\1>/gi)]
+    .map((match) => (match[2] ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " "))
+    .map((text) => text.replace(/\s+/g, " ").trim())
+    .filter((text) => text.length > 0);
+  if (matches.length > 0) return truncate(matches.join(" | "), 240);
+  const stripped = html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return stripped.length > 0 ? truncate(stripped, 240) : null;
+}
+
 /** Pull a machine code and message out of an IEEE/Mashery error body. */
 export function extractApiError(body: string, status: number): ApiErrorShape {
   const trimmed = body.trim();
@@ -102,11 +113,19 @@ export function extractApiError(body: string, status: number): ApiErrorShape {
       String(status);
     return { apiCode: String(code), apiMessage: message ? truncate(message) : null };
   } catch {
-    const looksLikeHtml = /<\s*(html|head|body|!doctype)/i.test(trimmed);
-    return {
-      apiCode: String(status),
-      apiMessage: looksLikeHtml ? "<non-JSON error page from the API gateway>" : truncate(trimmed),
-    };
+    // Mashery returns plain HTML for gateway-level failures. The heading carries
+    // the useful diagnosis (for example "Developer Inactive"), so keep it.
+    const looksLikeHtml = /<\s*(html|head|body|h1|!doctype)/i.test(trimmed);
+    if (looksLikeHtml) {
+      const text = htmlToText(trimmed);
+      return {
+        apiCode: text ? `HTML:${text}` : String(status),
+        apiMessage: text
+          ? `${text} (HTML error page from the IEEE API gateway)`
+          : "<non-JSON error page from the IEEE API gateway>",
+      };
+    }
+    return { apiCode: String(status), apiMessage: truncate(trimmed) };
   }
 }
 
@@ -137,7 +156,10 @@ export function classifyHttpStatus(status: number, api: ApiErrorShape): IeeeMcpE
         ...common,
         code: "FORBIDDEN",
         message: `IEEE API refused the request (HTTP 403).${api.apiMessage ? ` ${api.apiMessage}` : ""}`,
-        hint: "The key is not entitled to this endpoint, or the account is suspended. Not retried.",
+        hint:
+          "IEEE answers with HTTP 403 (often \"Developer Inactive\") when the API key is " +
+          "unregistered, not yet activated, or suspended - not only when it is wrong. " +
+          "Verify IEEE_API_KEY against https://developer.ieee.org. Not retried.",
       });
     case 404:
       return new IeeeMcpError({
