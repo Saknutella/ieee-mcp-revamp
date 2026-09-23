@@ -52,8 +52,19 @@ export function assertHostRuntimeHasSeaFuse(file = process.execPath) {
  * Windows refuses to load a PE whose Authenticode hash no longer matches, and
  * postject modifies the file, so the certificate table is removed first.
  * Returns what was found instead of assuming the binary was signed.
+ *
+ * This rewrites `file` in place, so it must only ever be handed a copy. It is
+ * called on dist/<artifact> after the runtime has been copied there. Pointing it
+ * at the live Node runtime would truncate the installation, so that is refused
+ * outright rather than left to the caller's discipline.
  */
 export function stripAuthenticodeSignature(file) {
+  if (fs.realpathSync.native(file) === fs.realpathSync.native(process.execPath)) {
+    throw new Error(
+      `refusing to strip the signature of the running Node runtime in place (${file}); ` +
+        `copy it to the output path first`
+    );
+  }
   const buffer = fs.readFileSync(file);
   if (buffer.length < 0x40 || buffer.readUInt16LE(0) !== 0x5a4d) {
     return { stripped: false, reason: "not a PE image (no MZ header)" };
