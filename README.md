@@ -99,7 +99,7 @@ Only the key is required; everything else has a sensible default.
 | `CROSSREF_MAILTO` | — | Contact address for Crossref's polite pool — **recommended**, it doubles your rate limit |
 | `IEEE_OUTPUT_DIR` | working directory | Base for relative export paths |
 | `IEEE_MCP_STATE_DIR` | `%LOCALAPPDATA%\ieee-mcp` | Usage ledger, cache and result sets |
-| `IEEE_DAILY_BUDGET` | `200` | Local call budget — see [Rate Limits](#rate-limits) |
+| `IEEE_DAILY_BUDGET` | `200` | Local call budget — see [Constraints](#constraints-of-the-non-commercial-api) |
 | `IEEE_MAX_RPS` | `8` | Requests/second cap, 1–10 |
 | `IEEE_LOG_LEVEL` | `info` | `silent` / `error` / `warn` / `info` / `debug` |
 | `IEEE_MCP_CROSSREF_ENABLED` | `1` | Set to `0` to disable `get_references` |
@@ -234,11 +234,7 @@ which fetches authoritative BibTeX one reference at a time.
 | `crossref` | Authoritative BibTeX via content negotiation — **preferred for IEEE papers**, since many references are deposited with a DOI and nothing else |
 | `none` | Omit BibTeX |
 
-Papers without a DOI are skipped and listed in `warnings`. These lookups **do not
-consume the IEEE budget** — `get_references` works with no IEEE key configured.
-
-> **Do not mix the two citation metrics.** A *reference count* is how many works a
-> paper cites (outgoing); a *citation count* is how many works cite it (incoming).
+Papers without a DOI are skipped and listed in `warnings`.
 
 ### Citing a paper
 
@@ -267,39 +263,77 @@ UTF-8 with BOM (opens cleanly in Excel) and includes provenance columns.
 
 ---
 
-## Rate Limits
+## Constraints of the non-commercial API
 
-**IEEE** — roughly 10 calls/second and 200 calls/day per key. Defaults here are
-`IEEE_MAX_RPS=8` and `IEEE_DAILY_BUDGET=200`. Every HTTP *attempt*, retries
-included, reserves budget before it is sent. The ledger is shared across
-processes, so two clients running at once cannot double-spend or exceed the
-per-second cap.
+Everything below follows from the IEEE Metadata Search API being a free,
+non-commercial service. None of it is a bug, and none of it can be fixed by
+changing code.
+
+### Quotas
+
+IEEE allows roughly **10 calls/second and 200 calls/day** per key. Defaults here
+are `IEEE_MAX_RPS=8` and `IEEE_DAILY_BUDGET=200`. Every HTTP attempt, retries
+included, reserves budget before it is sent, and the ledger is shared across
+processes so two clients running at once cannot double-spend.
 
 The counter is **local bookkeeping, not your official remaining quota**. IEEE
-publishes no rate-limit reset time zone (and returns no rate-limit headers at all),
-so this server assumes nothing: it tracks UTC day, local day and rolling 24h and
-reports all three. Where they disagree with IEEE, trust IEEE. Reset it by deleting
-`usage-ledger.json` in the state directory, or with
+publishes no reset time zone and returns no rate-limit headers, so this server
+assumes nothing: it tracks UTC day, local day and rolling 24h and reports all
+three. Where they disagree with IEEE, trust IEEE. Reset it by deleting
+`usage-ledger.json` from the state directory, or with
 `ieee_status({ "reset_local_usage": true })`.
 
-**Crossref** — no daily quota; limits are rate and concurrency. 5/s with
-concurrency 1 by default, or **10/s with concurrency 3** once you set
-`CROSSREF_MAILTO`. The default here is a conservative `CROSSREF_MAX_RPS=3`.
+Reference lookups go to Crossref instead, which has **no daily quota** — only rate
+and concurrency limits: 5/s by default, or 10/s once you set `CROSSREF_MAILTO`.
+Those requests never touch the IEEE budget, and `get_references` works without an
+IEEE key at all.
 
 Responses are cached on disk, so a cache hit costs nothing. Retried: network
 errors, timeouts, `408`, `425`, `429` (honouring `Retry-After`) and `5xx`. Not
 retried: `400`, `401`, `403`, `404`.
 
----
+### No full text
 
-## Limitations
+IEEE supports exactly three API use cases
+([official list](https://developer.ieee.org/Allowed_API_Uses)): Content Discovery
+and Indexing (what a personal Metadata key gets you), Open Access Articles, and
+**Text and Data Mining** — the last being full text, non-commercial research only,
+and requiring an active institutional IEEE Xplore subscription.
 
-- **Metadata only** — no full-text retrieval (see below).
+The legitimate route is therefore an **institutional TDM entitlement requested
+through your library**, not a personal key and not a scripted institutional login.
+Xplore's `robots.txt` disallows `/rest` and `/ielx*` (the PDF path) and disallows
+this agent type site-wide, and its terms prohibit robot retrieval and any use of
+the content to train AI systems. Reading a few PDFs yourself in a browser is fine —
+this server hands you the direct link in `verify.ieee_xplore` whenever you need it.
+
+If Crossref has no reference list for a paper and you already hold the PDF, the
+tool for extracting its bibliography is **GROBID** — not Zotero, whose "Retrieve
+PDF Metadata" only produces *item* metadata and is itself a Crossref consumer.
+
+### No reference or citing-work lists
+
+A full dump of an IEEE article object shows 31 fields, only two of which are
+citation *counts* — there is no reference list and no citing-work list.
+`get_references` fills the outgoing side from Crossref; citing-work lists are on
+the roadmap.
+
+Do not mix the two metrics: a *reference count* is how many works a paper cites
+(outgoing); a *citation count* is how many works cite it (incoming).
+
+### Deep paging
+
+IEEE caps results per request at 200. Paging stops early when a page adds no new
+unique records, and says why in `stop_reason`.
+
+### Other
+
 - **No facet parameters** (`facet`, `d-au`, `d-publisher`, `d-pubtype`, `d-year`) —
   IEEE defines these as returning refinement links, not result sets.
-- **Deep paging depends on IEEE**, which caps results per request at 200. Paging
-  stops early when a page adds no new unique records, and says why.
-- **The local counter ≠ the official quota** (see above).
+- **`doi` and `article_number` must be sent alone** — adding `max_records` makes
+  IEEE return `total_records: 1` while omitting the `articles` array entirely,
+  with no error. This server handles that for you.
+- **An invalid or inactive key returns 403, not 401.**
 - **Crossref references are only as complete as the publisher's deposit**, and many
   IEEE references carry only a DOI.
 - **`publication_year` formats vary** by publication; the value is passed through.
@@ -307,11 +341,6 @@ retried: `400`, `401`, `403`, `404`.
   may need biblatex.
 - **The exe is not code-signed**, so Windows SmartScreen may warn on first run.
 - **Windows x64 only.**
-
-Two things worth knowing about the live API: `doi` and `article_number` must be
-sent alone (adding `max_records` makes IEEE return `total_records: 1` while
-omitting the `articles` array entirely, with no error), and an invalid or inactive
-key returns **403, not 401**.
 
 ---
 
@@ -325,28 +354,6 @@ key returns **403, not 401**.
 - **IEEE DOI API** — a separate IEEE API resolving up to 25 DOIs per request, for
   back-filling metadata for DOIs you already have. Needs its own entitlement.
 - **RIS in `export_results`** — `output_format: "citation"` already emits RIS.
-
----
-
-## Full text
-
-**Not supported, and this is a permissions problem rather than a missing
-feature.** IEEE supports exactly three API use cases
-([official list](https://developer.ieee.org/Allowed_API_Uses)): Content Discovery
-and Indexing (what a personal Metadata key gets you), Open Access Articles, and
-**Text and Data Mining** — the latter being full text, non-commercial research
-only, and requiring an active institutional IEEE Xplore subscription.
-
-The legitimate route is therefore an **institutional TDM entitlement requested
-through your library**, not a personal key and not a scripted institutional login:
-Xplore's `robots.txt` disallows `/rest` and `/ielx*` (the PDF path), and disallows
-this agent type site-wide; its terms also prohibit robot retrieval and any use of
-the content to train AI systems. Reading a few PDFs yourself in a browser is fine —
-this server hands you the direct link in `verify.ieee_xplore` whenever you need it.
-
-If Crossref has no reference list for a paper and you already hold the PDF, the
-tool for extracting its bibliography is **GROBID** — not Zotero, whose "Retrieve
-PDF Metadata" only produces *item* metadata and is itself a Crossref consumer.
 
 ---
 
@@ -367,13 +374,5 @@ Tests run entirely against built-in mock servers for IEEE and Crossref, so they
 consume no real API quota. `IEEE_TEST_TARGET=bundle` tests the unbundled build for
 faster iteration. The build is byte-reproducible (the SEA config disables the V8
 code cache); set `IEEE_BUILD_CODE_CACHE=1` to opt in and lose that.
-
-Further reading, in Chinese:
-
-- [`docs/测试报告.md`](docs/测试报告.md) — test results and measured API behaviour
-- [`docs/IEEE-API-参数核对.md`](docs/IEEE-API-参数核对.md) — parameters compared
-  against the official IEEE documentation
-- [`docs/上游源码审计.md`](docs/上游源码审计.md) — line-level code audit
-- [`docs/README.zh-CN.md`](docs/README.zh-CN.md) — Chinese version of this README
 
 </details>
