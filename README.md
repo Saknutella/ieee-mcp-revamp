@@ -70,7 +70,7 @@ Config file locations differ per client; the format is the same everywhere.
 
 `command` must be the absolute path to the exe. Restart the client after editing,
 then ask the agent to call `ieee_status` to confirm it loaded. Through a proxy, add
-`"NODE_USE_ENV_PROXY": "1"` and `"HTTPS_PROXY": "http://127.0.0.1:7890"`.
+`"NODE_USE_ENV_PROXY": "1"` and `"HTTPS_PROXY": "http://127.0.0.1:<proxy_port>"`.
 
 ---
 
