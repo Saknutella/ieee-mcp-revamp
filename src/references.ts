@@ -80,6 +80,12 @@ export interface ReferenceLookupPayload {
     crossref_requests: number;
     crossref_cache_hits: number;
     ieee_calls_consumed: 0;
+    batching: {
+      enabled: boolean;
+      batch_size: number;
+      batch_requests: number;
+      note: string;
+    };
     note: string;
   };
 }
@@ -291,37 +297,87 @@ export async function lookupReferences(
     );
   }
 
-  const before = crossref.stats;
   const papers: PaperReferencesOut[] = [];
   let totalBibtexFetches = 0;
 
+  // Per-call counters. The client's own stats are process-wide, so subtracting
+  // them over a window is wrong when a client issues several tool calls at once:
+  // concurrent calls would each count the others' requests.
+  let countedRequests = 0;
+  let countedCacheHits = 0;
+  const countWork = (fromCache: boolean): void => {
+    if (fromCache) countedCacheHits += 1;
+    else countedRequests += 1;
+  };
+
+  // ── Fetch: one batched request covers many DOIs ────────────────────────────
+  // Crossref returns each work's complete reference array from a single
+  // `filter=doi:A,doi:B,...` request, so N papers usually cost 1 request
+  // instead of N. Anything the batch does not resolve (absent, or the batch
+  // itself failed) falls through to an individual request, which also yields a
+  // precise per-DOI error.
+  const prefetched = new Map<string, CrossrefWorkResult>();
+  const batchSize = Math.max(1, config.crossrefBatchSize);
+  const batchingEnabled = request.dois.length > 1 && batchSize > 1;
+  let batchRequests = 0;
+
+  if (batchingEnabled) {
+    for (let offset = 0; offset < request.dois.length; offset += batchSize) {
+      const chunk = request.dois.slice(offset, offset + batchSize);
+      try {
+        const batch = await crossref.getWorksBatch(chunk);
+        batchRequests += 1;
+        countWork(batch.fromCache);
+        for (const [doi, result] of batch.results) prefetched.set(doi, result);
+      } catch (error) {
+        const normalized = toIeeeMcpError(error);
+        log.warn(
+          `Crossref batch lookup of ${chunk.length} DOI(s) failed (${normalized.code}); ` +
+            "falling back to individual requests."
+        );
+      }
+    }
+    if (prefetched.size < request.dois.length) {
+      log.debug(
+        `Batch resolved ${prefetched.size}/${request.dois.length} DOI(s); ` +
+          `${request.dois.length - prefetched.size} will be fetched individually.`
+      );
+    }
+  }
+
   for (const doi of request.dois) {
     let result: CrossrefWorkResult;
-    try {
-      result = await crossref.getWork(doi);
-    } catch (error) {
-      const normalized = toIeeeMcpError(error);
-      log.warn(`Crossref lookup failed for ${doi}: ${normalized.code} ${normalized.message}`);
-      papers.push({
-        requested_doi: doi,
-        ok: false,
-        error: { code: normalized.code, message: normalized.message },
-        work: null,
-        references_count_from_crossref: null,
-        references_returned: 0,
-        counts_agree: null,
-        with_doi: 0,
-        without_doi: 0,
-        from_cache: false,
-        crossref_url: crossref.workUrl(doi),
-        verify: {
-          crossref: crossref.workUrl(doi),
-          doi: `https://doi.org/${doi}`,
-          ieee_xplore: null,
-        },
-        references: [],
-      });
-      continue;
+    const prefetchedResult = prefetched.get(doi);
+    if (prefetchedResult) {
+      result = prefetchedResult;
+    } else {
+      try {
+        result = await crossref.getWork(doi);
+        countWork(result.fromCache);
+      } catch (error) {
+        const normalized = toIeeeMcpError(error);
+        log.warn(`Crossref lookup failed for ${doi}: ${normalized.code} ${normalized.message}`);
+        papers.push({
+          requested_doi: doi,
+          ok: false,
+          error: { code: normalized.code, message: normalized.message },
+          work: null,
+          references_count_from_crossref: null,
+          references_returned: 0,
+          counts_agree: null,
+          with_doi: 0,
+          without_doi: 0,
+          from_cache: false,
+          crossref_url: crossref.workUrl(doi),
+          verify: {
+            crossref: crossref.workUrl(doi),
+            doi: `https://doi.org/${doi}`,
+            ieee_xplore: null,
+          },
+          references: [],
+        });
+        continue;
+      }
     }
 
     const used = new Set<string>();
@@ -341,6 +397,7 @@ export async function lookupReferences(
           totalBibtexFetches += 1;
           try {
             const fetched = await crossref.getBibtex(reference.doi);
+            countWork(fetched.fromCache);
             bibtex = fetched.bibtex;
             bibtexSource = "crossref_content_negotiation";
           } catch (error) {
@@ -394,7 +451,6 @@ export async function lookupReferences(
     });
   }
 
-  const after = crossref.stats;
   const succeeded = papers.filter((paper) => paper.ok);
   const totals = succeeded.reduce(
     (sum, paper) => ({
@@ -427,9 +483,18 @@ export async function lookupReferences(
     papers,
     warnings,
     usage: {
-      crossref_requests: after.requests - before.requests,
-      crossref_cache_hits: after.cacheHits - before.cacheHits,
+      crossref_requests: countedRequests,
+      crossref_cache_hits: countedCacheHits,
       ieee_calls_consumed: 0,
+      batching: {
+        enabled: batchingEnabled,
+        batch_size: batchSize,
+        batch_requests: batchRequests,
+        note:
+          "One Crossref request returns each work's COMPLETE reference array, so cost does not scale " +
+          "with the number of references. Only bibtex_mode='crossref' scales with the number of " +
+          "DOI-bearing references (one content-negotiation request each).",
+      },
       note:
         "Crossref is a separate, free data source. These requests did NOT consume the IEEE daily budget " +
         "and are not recorded in the IEEE usage ledger.",

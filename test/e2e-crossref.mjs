@@ -180,30 +180,69 @@ export async function run() {
     reporter.equal("cached lookup still returns 14 references", toolJson(byId(cacheRun.responses, 2))?.totals?.references, 14);
 
     // ── multiple DOIs, one of them missing ───────────────────────────────────
-    reporter.section("multiple DOIs with a partial failure");
+    reporter.section("batched multi-DOI lookup");
     crossrefMock.state.requests.length = 0;
     const multiRun = await mcpBatch(target, {
       label: "crossref-multi",
       env: baseEnv(ieeeMock, crossrefMock, freshDir("crossref-multi")),
       requests: session([
         toolCall(2, "get_references", {
-          dois: ["10.1109/mock.tcsii.2021", `${MISSING_MARKER}.refs`, "10.1109/mock.esscirc.2019"],
+          dois: ["10.1109/mock.tcsii.2021", "10.1109/mock.esscirc.2019", "10.1109/mock.norefs"],
         }),
       ]),
     });
     const multi = toolJson(byId(multiRun.responses, 2));
-    reporter.equal("three papers requested", multi?.requested, 3);
-    reporter.equal("two papers succeeded", multi?.succeeded, 2);
-    reporter.equal("one paper failed", multi?.failed, 1);
-    reporter.equal("total references across papers", multi?.totals?.references, 21);
-    const failedPaper = multi?.papers?.find((entry) => !entry.ok);
+    const batchRequests = crossrefMock.state.requests.filter((request) => request.isBatch);
+    reporter.equal("three DOIs cost exactly one batched request", batchRequests.length, 1);
+    reporter.equal(
+      "the batch carried all three DOIs",
+      batchRequests[0]?.batchDois?.length,
+      3
+    );
+    reporter.equal("all three papers succeeded", multi?.succeeded, 3);
+    reporter.equal("total references across the batch", multi?.totals?.references, 21);
+    reporter.check(
+      "batching is reported in usage",
+      multi?.usage?.batching?.enabled === true && multi?.usage?.batching?.batch_requests === 1,
+      JSON.stringify(multi?.usage?.batching)
+    );
+    reporter.check(
+      "usage explains that cost does not scale with reference count",
+      /does not scale|COMPLETE reference array/i.test(multi?.usage?.batching?.note ?? ""),
+      multi?.usage?.batching?.note
+    );
+    reporter.equal("records fetched via a batch are not marked as cache hits", multi?.usage?.crossref_cache_hits, 0);
+
+    // A batch that cannot resolve a DOI must fall back to an individual request,
+    // which is what produces a precise per-DOI error.
+    reporter.section("partial failure inside a batch");
+    crossrefMock.state.requests.length = 0;
+    const partialRun = await mcpBatch(target, {
+      label: "crossref-partial",
+      env: baseEnv(ieeeMock, crossrefMock, freshDir("crossref-partial")),
+      requests: session([
+        toolCall(2, "get_references", {
+          dois: ["10.1109/mock.tcsii.2021", `${MISSING_MARKER}.refs`, "10.1109/mock.esscirc.2019"],
+        }),
+      ]),
+    });
+    const partial = toolJson(byId(partialRun.responses, 2));
+    reporter.equal("two of three papers succeed", partial?.succeeded, 2);
+    reporter.equal("one paper fails", partial?.failed, 1);
+    reporter.equal("total references across papers", partial?.totals?.references, 21);
+    const failedPaper = partial?.papers?.find((entry) => !entry.ok);
     reporter.equal("the missing DOI reports NOT_FOUND", failedPaper?.error?.code, "NOT_FOUND");
     reporter.check(
       "the failure keeps a Crossref URL for inspection",
       failedPaper?.crossref_url?.includes("/works/") && failedPaper.crossref_url.includes("10.9999"),
       failedPaper?.crossref_url
     );
-    reporter.check("the other two still returned data", multi?.papers?.filter((entry) => entry.ok).length === 2);
+    reporter.check("the other two still returned data", partial?.papers?.filter((entry) => entry.ok).length === 2);
+    reporter.check(
+      "only the unresolved DOI needed an individual request (1 batch + 1 single)",
+      crossrefMock.state.requests.length === 2,
+      JSON.stringify(crossrefMock.state.requests.map((r) => (r.isBatch ? `batch(${r.batchDois.length})` : r.doi)))
+    );
 
     // ── zero references and count mismatch ───────────────────────────────────
     reporter.section("edge cases");
@@ -377,7 +416,16 @@ export async function run() {
     });
     const refsPayload = toolJson(byId(refsOnlyRun.responses, 2));
     reporter.equal("two reference lookups made no IEEE call", refsPayload?.usage?.ieee_calls_consumed, 0);
-    reporter.check("Crossref requests were recorded separately", refsPayload?.usage?.crossref_requests >= 2, JSON.stringify(refsPayload?.usage));
+    reporter.equal(
+      "two DOIs were resolved in a single batched Crossref request",
+      refsPayload?.usage?.crossref_requests,
+      1
+    );
+    reporter.check(
+      "batching is reported",
+      refsPayload?.usage?.batching?.enabled === true,
+      JSON.stringify(refsPayload?.usage?.batching)
+    );
     const status = toolJson(byId(refsOnlyRun.responses, 3));
     reporter.equal("the IEEE ledger still shows exactly one call", status?.local_usage?.local_calls_utc_day, 1);
     reporter.check("status reports Crossref separately", status?.crossref?.enabled === true, JSON.stringify(status?.crossref));
@@ -461,6 +509,51 @@ export async function run() {
       "IEEE identifier lookup still sends only the identifier",
       paramKeys(ieeeMock.state.requests.find((request) => request.params?.article_number === "1000001")),
       "article_number"
+    );
+
+    // ── citing a paper ───────────────────────────────────────────────────────
+    reporter.section("citation output");
+    const citeRun = await mcpBatch(target, {
+      label: "crossref-citation",
+      env: baseEnv(ieeeMock, crossrefMock, freshDir("crossref-citation")),
+      requests: session([
+        toolCall(2, "get_paper_details", { article_number: "1000001", output_format: "citation" }),
+        toolCall(3, "search_papers", { querytext: "radar", max_records: 2, output_format: "citation" }),
+        toolCall(4, "get_paper_details", { article_number: "1000001" }),
+      ]),
+    });
+    const citation = toolText(byId(citeRun.responses, 2));
+    reporter.check("citation output is produced for one paper", citation.includes("# Citation bundle"), citation.slice(0, 200));
+    reporter.check(
+      "citation output names IEEE as the metadata source",
+      citation.includes("IEEE Xplore Metadata Search API"),
+      citation.slice(0, 300)
+    );
+    reporter.check("citation output warns that author initials are mechanical", /best-effort/i.test(citation), citation.slice(0, 900));
+    reporter.check("citation output contains a plain citation", citation.includes("**Plain citation**"), citation.slice(0, 900));
+    reporter.check("citation output contains BibTeX", citation.includes("```bibtex") && /@(article|inproceedings|misc|book)\{/.test(citation), citation.slice(0, 2000));
+    reporter.check("citation output contains RIS", citation.includes("```ris") && citation.includes("TY  - "), citation.slice(0, 2500));
+    reporter.check("RIS has an end tag", citation.includes("ER  - "), citation.slice(-400));
+    reporter.check(
+      "the plain citation uses IEEE-style initials",
+      /\b[A-Z]\.\s/.test(citation),
+      (citation.match(/\[?\d*\]?\s*[^\n]*\n/) ?? [""])[0]
+    );
+    reporter.check(
+      "citation output reports missing fields when relevant",
+      citation.includes("Missing from the IEEE record") || !citation.includes("missing"),
+      citation.slice(0, 1200)
+    );
+    const multiCitation = toolText(byId(citeRun.responses, 3));
+    reporter.check(
+      "citation output handles several records at once",
+      (multiCitation.match(/^## \d+\./gm) ?? []).length === 2,
+      multiCitation.slice(0, 400)
+    );
+    reporter.check(
+      "json remains the default format",
+      toolJson(byId(citeRun.responses, 4))?.articles?.[0]?.article_number === "1000001",
+      "default output_format changed"
     );
   } finally {
     await ieeeMock.close();

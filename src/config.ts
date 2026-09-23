@@ -56,6 +56,8 @@ export interface Config {
   crossrefIsDefaultBase: boolean;
   crossrefMailto: string | null;
   crossrefMaxRps: number;
+  /** How many DOIs go into one Crossref `/works?filter=doi:...` request. */
+  crossrefBatchSize: number;
   /** Upper bound on how many papers one reference lookup may query. */
   maxDoisPerCall: number;
   /** Upper bound on authoritative BibTeX fetches (one request each). */
@@ -255,6 +257,7 @@ export function loadConfig(): Config {
     );
   }
   const crossrefMaxRps = intEnv("CROSSREF_MAX_RPS", 3, 1, 20, warnings);
+  const crossrefBatchSize = intEnv("CROSSREF_BATCH_SIZE", 20, 1, 50, warnings);
   const maxDoisPerCall = intEnv("IEEE_MCP_MAX_DOIS_PER_CALL", 20, 1, 100, warnings);
   const maxBibtexFetchesPerCall = intEnv("IEEE_MCP_MAX_BIBTEX_PER_CALL", 25, 0, 200, warnings);
 
@@ -293,6 +296,7 @@ export function loadConfig(): Config {
     crossrefIsDefaultBase,
     crossrefMailto,
     crossrefMaxRps,
+    crossrefBatchSize,
     maxDoisPerCall,
     maxBibtexFetchesPerCall,
     warnings,
@@ -326,6 +330,7 @@ export function describeConfig(config: Config): Record<string, unknown> {
     crossref_api_base_overridden: !config.crossrefIsDefaultBase,
     crossref_polite_pool: Boolean(config.crossrefMailto),
     crossref_max_rps: config.crossrefMaxRps,
+    crossref_batch_size: config.crossrefBatchSize,
     max_dois_per_call: config.maxDoisPerCall,
   };
 }

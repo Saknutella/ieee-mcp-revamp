@@ -169,7 +169,7 @@ curl.exe --proxy http://127.0.0.1:7890 "https://ieeexploreapi.ieee.org/api/v1/se
 | `search_papers` | 主检索：单查询或多查询合并，支持全部过滤与分页参数 |
 | `search_by_author` | 按作者检索（`search_papers` 的便捷封装） |
 | `search_by_publication` | 在指定期刊/会议内检索 |
-| `get_paper_details` | 按 DOI 或 article_number 取单篇完整元数据 |
+| `get_paper_details` | 按 DOI 或 article_number 取单篇完整元数据；`output_format: "citation"` 直接给出引用 |
 | `get_paper_citations` | 取单篇的引用论文数 / 引用专利数 |
 | `get_references` | **取参考文献列表（数据源是 Crossref，不是 IEEE）**，支持 BibTeX |
 | `export_results` | 导出 UTF-8 CSV / JSON / BibTeX |
@@ -205,7 +205,7 @@ ESSCIRC 2019（art. 8902902）7/7，**连出版商没给 DOI 的那几条都对�
 ### 用法
 
 ```jsonc
-// 单个或多个 DOI
+// 单个或多个 DOI（多个会自动合并成一次请求，见下）
 { "dois": ["10.1109/TCSII.2021.3077589", "10.1109/ESSCIRC.2019.8902902"] }
 
 // 或直接接着一次 IEEE 检索的结果（会自动附上 IEEE 页面核验链接）
@@ -216,6 +216,30 @@ ESSCIRC 2019（art. 8902902）7/7，**连出版商没给 DOI 的那几条都对�
 { "dois": ["10.1109/TCSII.2021.3077589"], "output_format": "markdown" }
 { "dois": ["10.1109/TCSII.2021.3077589"], "output_format": "bibtex" }
 ```
+
+### 请求次数怎么算（重要）
+
+**一次请求返回一篇论文的完整引用数组，所以费用不随引用条数增长。**
+
+| 操作 | 请求数 |
+|---|---|
+| 查 1 篇的引用列表 | **1 次**（实测：14 条引用一次返回） |
+| 查 N 篇的引用列表 | **1 次**（批量，实测 3 篇 / 42 条引用一次返回） |
+| `bibtex_mode: "crossref"`（权威 BibTeX） | **每个带 DOI 的条目 1 次** ← 唯一按条数计的 |
+| 命中缓存 | **0 次** |
+
+多 DOI 会自动走 Crossref 的批量接口 `filter=doi:A,doi:B,...`（字段名必须重复，
+写成 `doi:A,B` 会被 Crossref 以 400 拒绝）。批量的取舍：
+
+- 批量上限 `CROSSREF_BATCH_SIZE`（默认 20，超过则分块）；
+- **批量没覆盖到的 DOI 会自动降级为单篇请求**——单篇请求才能给出精确的
+  `NOT_FOUND` 等错误，所以部分失败时仍然每篇独立报错；
+- 批量失败（网络等）时整块降级为逐篇请求。
+
+引自 Crossref 官方说明：**没有每日配额**，限制是速率与并发 —— Public 5/秒、并发 1；
+带 `mailto` 的 Polite 池 10/秒、并发 3（付费 Plus 150/秒）。实测响应头会直接回显
+`x-rate-limit-limit` / `x-concurrency-limit`。所以这里的成本瓶颈从来不是"条数"，
+而是速率。
 
 ### 返回内容
 
@@ -556,6 +580,7 @@ next_start_record   = last_returned_index + 1
 | `CROSSREF_MAX_RPS` | `3` | Crossref 请求频率上限（礼貌限速） |
 | `IEEE_MCP_MAX_DOIS_PER_CALL` | `20` | 单次 `get_references` 最多查几篇 |
 | `IEEE_MCP_MAX_BIBTEX_PER_CALL` | `25` | 单次最多取多少条权威 BibTeX |
+| `CROSSREF_BATCH_SIZE` | `20` | 一次批量请求合并多少个 DOI |
 
 ---
 
@@ -649,9 +674,96 @@ Crossref `/works` 接口），**不消耗任何真实 API 额度**。覆盖：
 
 ---
 
+## 引用一篇论文
+
+`get_paper_details` 加 `output_format: "citation"` 会返回一个**可直接使用的引用包**：
+
+```jsonc
+{ "doi": "10.1109/TCSII.2021.3077589", "output_format": "citation" }
+```
+
+内含三种形式：
+
+| 形式 | 用途 |
+|---|---|
+| **纯文本引用**（IEEE 风格） | 直接粘进正文/参考文献表 |
+| **BibTeX** | LaTeX、Zotero、JabRef |
+| **RIS** | **Zotero / EndNote / Mendeley 导入**（你说的 Zotero 就用这个） |
+
+实测输出：
+
+```
+J. Park, Y. Shin, J. Choi, and S. Kim, "A 5.02nW 32-kHz Self-Reference Power Gating XO
+With Fast Startup Time Assisted by Negative Resistance and Initial Noise Boosters",
+IEEE Transactions on Circuits and Systems II: Express Briefs, vol. 68, no. 11,
+pp. 3386-3390, 2021, doi: 10.1109/TCSII.2021.3077589.
+```
+
+**必须知道的两点：**
+
+1. **元数据来源是 IEEE**（这个功能不走 Crossref），但引用字符串是**机械拼装**的——
+   信息全部来自 IEEE 返回的字段，缺失的字段会显式标注，`missing_fields` 也会一并列出。
+2. **IEEE 风格的作者缩写是启发式转换**（`Jee-Ho Park` → `J. Park`），姓名顺序本身
+   随文化而异，**投稿前请自行核对作者格式**。BibTeX 和 RIS 用完整姓名，没有这个问题。
+
+`search_papers` 等检索工具同样支持 `output_format: "citation"`，一次给多篇的引用包。
+
+---
+
+## 关于"正文"（全文获取）
+
+**当前不支持，且不是实现问题。** IEEE 官方
+[Currently Supported API Use Cases](https://developer.ieee.org/Allowed_API_Uses) 只支持三种用途：
+
+| 用途 | 内容 |
+|---|---|
+| Content Discovery and Indexing | 元数据抽取与索引 ← **你现在这个 key** |
+| Open Access Articles | 开放获取全文 |
+| **Text and Data Mining (TDM)** | 全文，**仅限非商业研究，且要求机构有有效的 IEEE Xplore 订阅**，需联系 IEEE 申请 |
+
+**要合法拿到正文，路径是"通过你所在机构的图书馆申请 TDM 权限"**，而不是用个人
+Metadata key，也不是脚本化机构登录。理由：
+
+- 你的 `IEEE_API_KEY` 是**个人 Metadata key**，不携带机构订阅权限；
+- IEEE Xplore 的 `robots.txt` 明确写着 `Disallow: /rest`（内部接口）与
+  **`Disallow: /ielx*`**——后者正是 PDF 下载路径的形态；
+- 同一份 `robots.txt` 里 **`ClaudeBot` / `Claude-User` 被整站 `Disallow: /`**，
+  `GPTBot`、`Google-Extended`、`PerplexityBot`、`CCBot` 等一长串 AI agent 同样被整站禁止；
+- IEEE API ToU 禁止 robot/spider 检索或索引 Content，并**禁止将 Content 用于训练或开发
+  任何 AI/LLM 系统**——这一条即使拿到 TDM 权限也仍然适用。
+
+所以：**少量 PDF 你自己在浏览器里点开读没问题**（网站就是给读者的）；
+**批量拿正文只走机构 TDM 申请**。用脚本登录机构账号批量下载，风险落在**你所在机构的
+整站访问权**上，不是小事。
+
+工具已经给出了人工核验的直链（`verify.ieee_xplore`），需要看正文时点开即可。
+
+### 参考文献的另一条路：从 PDF 提取
+
+如果某篇论文 Crossref 没有存缴引用列表（这样就没有 `reference[]`），
+那就只能从 PDF 里解析。做这件事的**不是 Zotero**，而是 **GROBID**：
+
+| | Zotero | GROBID |
+|---|---|---|
+| 「Retrieve PDF Metadata」做什么 | 把 PDF **前几页文本**发给 Zotero 服务，结合 Crossref 与 DOI/ISBN 查询，生成**文献条目元数据**（标题/作者等） | 不适用 |
+| 提取 PDF 里的**参考文献列表** | **不做** | **专门做这个**：References extraction and parsing，F1 ≈ 0.87–0.90 |
+| 许可 | AGPL | Apache-2.0 |
+| 平台 | 跨平台 | **官方只支持 Linux/macOS**（Windows 需 Docker/WSL）；Java，提取引用约需 3 GB 内存 |
+
+Zotero 的 PDF 识别功能其实是 **Crossref 的下游消费者**——和本服务用的是同一个数据源，
+所以**去看 Zotero 不会带来新能力**。
+
+**建议的决策顺序：**
+
+1. 先查 Crossref（`get_references`）——有就用它，**完全不需要 PDF**；
+2. Crossref 没有引用列表，且你**已经合法持有该 PDF**（自己下载的单篇），才考虑 GROBID；
+3. 为了批量拿引用而去批量抓 PDF，回到上面的访问权限问题，不建议。
+
+---
+
 ## 已知限制
 
-1. **只有元数据检索**，没有正文/PDF 获取（本次明确不实现；官方全文端点与 API key 权限模型不同）。
+1. **只有元数据检索**，没有正文/PDF 获取（见上文"关于正文"，是权限模型问题，不是实现问题）。
 2. **不支持 facet 参数**（`facet`/`d-au`/`d-publisher`/`d-pubtype`/`d-year`）：
    官方定义它们返回"细化链接"而非结果集。
 3. **深层分页依赖 IEEE 行为**：官方在 `start_record` 下注有 "maximum results is 200"；
@@ -684,6 +796,10 @@ Crossref `/works` 接口），**不消耗任何真实 API 额度**。覆盖：
   本服务在错误提示中已明确指出这一点，且不对 403 重试。
 - 少数历史文献可由检索命中、但用 `article_number` 取不到记录体；此时返回空结果并给出说明，
   不会编造数据。
+- **Crossref 引用数的可信度只在小样本上验证过**（2 篇、21 条，逐位全中）。它是出版商存缴
+  数据的镜像，有理有据，但**不是全覆盖**：出版商没存缴的就没有，很多条目只有 DOI 没有题录。
+- **不要跨源比较被引次数**：同一篇 ESSCIRC 2019，IEEE 15 / Crossref 15 / OpenAlex 18。
+  参考文献数（outgoing）与被引次数（incoming）是两个方向的指标，绝不可混用。
 
 ---
 

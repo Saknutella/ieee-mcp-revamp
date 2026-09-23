@@ -19,7 +19,7 @@ import type { DiskCache } from "./cache.js";
 import { normalizeArticles } from "./normalize.js";
 import { isValidSearchId, type ResultStore } from "./resultStore.js";
 import { defaultExportName, exportRecords, type ExportFormat } from "./exporter.js";
-import { payloadToMarkdown, toBibtex, toCsv, toJsonText, type OutputFormat } from "./format.js";
+import { payloadToMarkdown, citationBundle, toBibtex, toCsv, toJsonText, type OutputFormat } from "./format.js";
 import {
   CONTENT_TYPES,
   MAX_RECORDS_PER_REQUEST,
@@ -45,7 +45,7 @@ const CONTENT_TYPE_ENUM = z.enum([...CONTENT_TYPES] as [ContentType, ...ContentT
 const SORT_FIELD_ENUM = z.enum([...SORT_FIELDS] as [SortField, ...SortField[]]);
 const SORT_ORDER_ENUM = z.enum([...SORT_ORDERS] as [SortOrder, ...SortOrder[]]);
 const PUBLISHER_ENUM = z.enum([...PUBLISHERS] as [string, ...string[]]);
-const OUTPUT_FORMAT_ENUM = z.enum(["json", "markdown", "csv", "bibtex"]);
+const OUTPUT_FORMAT_ENUM = z.enum(["json", "markdown", "csv", "bibtex", "citation"]);
 const EXPORT_FORMAT_ENUM = z.enum(["csv", "json", "bibtex"]);
 
 const SCOPE_NOTE =
@@ -91,6 +91,8 @@ function renderPayload(payload: SearchResultPayload, format: OutputFormat): stri
         endpoint: "https://ieeexploreapi.ieee.org/api/v1/search/articles",
         query: payload.query,
       });
+    case "citation":
+      return citationBundle(payload.articles, payload.retrieved_at);
     case "json":
     default:
       return toJsonText(payload);
@@ -251,13 +253,19 @@ export function registerTools(server: McpServer, deps: ToolDependencies): void {
           .optional()
           .describe("IEEE article number. Takes precedence over doi if both are supplied."),
         doi: z.string().optional().describe("Document DOI, e.g. 10.1109/ACCESS.2023.1234567."),
+        output_format: OUTPUT_FORMAT_ENUM.optional().describe(
+          "json (default) returns all metadata. `citation` returns a ready-to-paste citation " +
+            "bundle: a plain IEEE-style reference string, a BibTeX entry, and an RIS record " +
+            "(RIS imports straight into Zotero / EndNote / Mendeley). " +
+            "markdown / csv / bibtex are also available."
+        ),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async (args) => {
       try {
         const { payload } = await executeIdentifierLookup(searchContext, args, "get_paper_details");
-        return ok(payload, "json");
+        return ok(payload, (args.output_format ?? "json") as OutputFormat);
       } catch (error) {
         return fail(error);
       }

@@ -231,45 +231,57 @@ export async function run() {
 
     // ── key redaction ────────────────────────────────────────────────────────
     reporter.section("secret redaction");
-    mock.state.requests.length = 0;
-    mock.state.failures = [
-      {
-        status: 401,
-        body: { message: `Invalid API key supplied: ${API_KEY}`, apikey: API_KEY, echo: `apikey=${API_KEY}` },
-        times: 1,
-      },
-    ];
-    const redactRun = await mcpBatch(target, {
-      label: "resilience-redact",
-      env: baseEnv(mock, freshDir("resilience-redact")),
-      requests: session([toolCall(2, "search_papers", { querytext: "redact" })]),
-    });
-    reporter.check(
-      "the API key never reaches stdout",
-      !redactRun.stdout.includes(API_KEY),
-      redactRun.stdout.slice(0, 400)
-    );
-    reporter.check(
-      "the API key never reaches stderr",
-      !redactRun.stderr.includes(API_KEY),
-      redactRun.stderr.slice(0, 600)
-    );
-    const redactedError = errorPayload(byId(redactRun.responses, 2));
-    reporter.check(
-      "the error payload is scrubbed",
-      !JSON.stringify(redactedError).includes(API_KEY),
-      JSON.stringify(redactedError)
-    );
-    reporter.check(
-      "the redaction marker is present",
-      JSON.stringify(redactedError).includes("[REDACTED]") || JSON.stringify(redactedError).includes("***"),
-      JSON.stringify(redactedError)
-    );
-    reporter.check(
-      "the URL logged to stderr is also scrubbed",
-      !/apikey=[0-9a-f]{32}/i.test(redactRun.stderr),
-      redactRun.stderr.slice(0, 500)
-    );
+    // A dedicated mock instance: this section queues a single failure and must not
+    // be coupled to whatever the shared mock's queue looks like by now.
+    const redactMock = await startMockServer();
+    try {
+      redactMock.state.requests.length = 0;
+      redactMock.state.failures = [
+        {
+          status: 401,
+          body: { message: `Invalid API key supplied: ${API_KEY}`, apikey: API_KEY, echo: `apikey=${API_KEY}` },
+          times: 1,
+        },
+      ];
+      const redactRun = await mcpBatch(target, {
+        label: "resilience-redact",
+        env: baseEnv(redactMock, freshDir("resilience-redact")),
+        requests: session([toolCall(2, "search_papers", { querytext: "redact" })]),
+      });
+      reporter.check(
+        "the mock served the canned 401 (so the redaction path was actually exercised)",
+        redactMock.state.requests.length === 1,
+        `${redactMock.state.requests.length} request(s) reached the redaction mock`
+      );
+      reporter.check(
+        "the API key never reaches stdout",
+        !redactRun.stdout.includes(API_KEY),
+        redactRun.stdout.slice(0, 400)
+      );
+      reporter.check(
+        "the API key never reaches stderr",
+        !redactRun.stderr.includes(API_KEY),
+        redactRun.stderr.slice(0, 600)
+      );
+      const redactedError = errorPayload(byId(redactRun.responses, 2));
+      reporter.check(
+        "the error payload is scrubbed",
+        !JSON.stringify(redactedError).includes(API_KEY),
+        JSON.stringify(redactedError)
+      );
+      reporter.check(
+        "the redaction marker is present",
+        JSON.stringify(redactedError).includes("[REDACTED]") || JSON.stringify(redactedError).includes("***"),
+        JSON.stringify(redactedError)
+      );
+      reporter.check(
+        "the URL logged to stderr is also scrubbed",
+        !/apikey=[0-9a-f]{32}/i.test(redactRun.stderr),
+        redactRun.stderr.slice(0, 500)
+      );
+    } finally {
+      await redactMock.close();
+    }
     mock.state.failures = [];
   } finally {
     await mock.close();

@@ -164,12 +164,22 @@ export function createMockCrossrefServer(state = createMockCrossrefState()) {
       transform = rest.slice(transformIndex + "/transform/".length);
       rest = rest.slice(0, transformIndex);
     }
-    const doi = decodeURIComponent(rest);
+    const isBatch = url.pathname === "/works" || url.pathname === "/works/";
+    const batchDois = isBatch
+      ? (url.searchParams.get("filter") ?? "")
+          .split(",")
+          .map((pair) => pair.trim())
+          .filter((pair) => pair.startsWith("doi:"))
+          .map((pair) => pair.slice(4))
+      : [];
+    const doi = isBatch ? "" : decodeURIComponent(rest);
 
     state.requests.push({
       at: Date.now(),
       rawUrl: req.url ?? "",
       doi,
+      batchDois,
+      isBatch,
       transform,
       userAgent: req.headers["user-agent"] ?? null,
       accept: req.headers.accept ?? null,
@@ -194,6 +204,22 @@ export function createMockCrossrefServer(state = createMockCrossrefState()) {
         queued.times -= 1;
         if (queued.times <= 0) state.failures.shift();
         send(queued.status, JSON.stringify({ status: "error", message: queued.body ?? "mock failure" }), "application/json");
+        return;
+      }
+
+      if (isBatch) {
+        if (batchDois.length === 0) {
+          send(400, JSON.stringify({ status: "failed", message: [{ type: "filter-not-available" }] }), "application/json");
+          return;
+        }
+        // Crossref simply omits works it does not have, so a batch can cover
+        // fewer DOIs than requested.
+        const items = batchDois.filter((entry) => !/^10\.9999\//.test(entry)).map((entry) => buildWork(entry));
+        send(
+          200,
+          JSON.stringify({ status: "ok", message: { "total-results": items.length, items } }),
+          "application/json"
+        );
         return;
       }
 

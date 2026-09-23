@@ -8,7 +8,7 @@
 import type { PaperRecord, SearchResultPayload, UsageInfo } from "./types.js";
 import type { ReferenceLookupPayload } from "./references.js";
 
-export type OutputFormat = "json" | "markdown" | "csv" | "bibtex";
+export type OutputFormat = "json" | "markdown" | "csv" | "bibtex" | "citation";
 
 export const CSV_BOM = "\uFEFF";
 
@@ -362,6 +362,177 @@ export function referencesToBibtex(payload: ReferenceLookupPayload): string {
     }
   }
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * Best-effort IEEE-style author string: "Alice Zhang" -> "A. Zhang",
+ * "Zhang, Alice" -> "A. Zhang", and tokens that already look like initials are
+ * kept as-is. Name order is a convention that varies by culture, so the caller
+ * is told this is mechanical.
+ */
+export function ieeeAuthorName(fullName: string): string {
+  const cleaned = fullName.trim();
+  if (cleaned.length === 0) return cleaned;
+  const initialOf = (word: string): string =>
+    /^([A-Z]\.){1,4}$/.test(word) ? word : `${word[0]?.toUpperCase() ?? ""}.`;
+
+  if (cleaned.includes(",")) {
+    const [last, rest] = cleaned.split(",", 2);
+    const initials = (rest ?? "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(initialOf)
+      .join(" ");
+    return `${initials ? `${initials} ` : ""}${(last ?? "").trim()}`;
+  }
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+  if (parts.length === 1) return cleaned;
+  const last = parts[parts.length - 1];
+  const initials = parts.slice(0, -1).map(initialOf).join(" ");
+  return `${initials} ${last}`;
+}
+
+function ieeeAuthorList(record: PaperRecord): string | null {
+  const names = record.authors.map((author) => ieeeAuthorName(author.name));
+  if (names.length === 0) return null;
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+/** Plain-text IEEE-style reference string, built only from returned metadata. */
+export function toIeeeCitation(record: PaperRecord, index?: number): string {
+  const parts: string[] = [];
+  const authors = ieeeAuthorList(record);
+  if (authors) parts.push(authors);
+  parts.push(record.title ? `"${record.title}"` : "(title not returned by IEEE)");
+  if (record.publication_title) parts.push(record.publication_title);
+  if (record.volume) parts.push(`vol. ${record.volume}`);
+  if (record.issue) parts.push(`no. ${record.issue}`);
+  if (record.pages) parts.push(`pp. ${record.pages}`);
+  if (record.year) parts.push(record.year);
+  if (record.doi) parts.push(`doi: ${record.doi}`);
+  const prefix = index === undefined ? "" : `[${index}] `;
+  return `${prefix}${parts.join(", ")}.`;
+}
+
+const RIS_TYPE: Record<string, string> = {
+  journals: "JOUR",
+  magazines: "JOUR",
+  "early access": "JOUR",
+  conferences: "CPAPER",
+  books: "BOOK",
+  standards: "STD",
+  courses: "GEN",
+};
+
+function risType(record: PaperRecord): string {
+  const contentType = (record.content_type ?? "").toLowerCase();
+  for (const [key, value] of Object.entries(RIS_TYPE)) {
+    if (contentType.includes(key)) return value;
+  }
+  return "GEN";
+}
+
+function splitPages(pages: string | null): { start: string | null; end: string | null } {
+  if (!pages) return { start: null, end: null };
+  const match = /^\s*([A-Za-z]?\d+)\s*[-–]\s*([A-Za-z]?\d+)\s*$/.exec(pages);
+  if (match) return { start: match[1], end: match[2] };
+  return { start: pages.trim(), end: null };
+}
+
+/**
+ * RIS record, importable by Zotero, EndNote, Mendeley and most reference
+ * managers. This is the format to use for "put this paper in my library".
+ */
+export function toRis(record: PaperRecord): string {
+  const lines: string[] = [`TY  - ${risType(record)}`];
+  for (const author of record.authors) {
+    // RIS prefers "Family, Given"; fall back to the name as returned.
+    const [first, ...rest] = author.name.split(/\s+/);
+    const family = rest.length > 0 ? rest[rest.length - 1] : first;
+    const given = rest.length > 1 ? rest.slice(0, -1).join(" ") : rest.length === 1 ? first : "";
+    lines.push(`AU  - ${given ? `${family}, ${given}` : family}`);
+  }
+  if (record.title) lines.push(`TI  - ${record.title}`);
+  if (record.publication_title) lines.push(`JO  - ${record.publication_title}`);
+  if (record.volume) lines.push(`VL  - ${record.volume}`);
+  if (record.issue) lines.push(`IS  - ${record.issue}`);
+  const pages = splitPages(record.pages);
+  if (pages.start) lines.push(`SP  - ${pages.start}`);
+  if (pages.end) lines.push(`EP  - ${pages.end}`);
+  if (record.year) lines.push(`PY  - ${record.year}`);
+  if (record.publication_date) lines.push(`DA  - ${record.publication_date}`);
+  if (record.publisher) lines.push(`PB  - ${record.publisher}`);
+  if (record.issn) lines.push(`SN  - ${record.issn}`);
+  else if (record.isbn) lines.push(`SN  - ${record.isbn}`);
+  if (record.doi) lines.push(`DO  - ${record.doi}`);
+  const url = record.html_url ?? record.abstract_url ?? (record.doi ? `https://doi.org/${record.doi}` : null);
+  if (url) lines.push(`UR  - ${url}`);
+  if (record.abstract) lines.push(`AB  - ${record.abstract.replace(/\s+/g, " ")}`);
+  if (record.keywords.ieee_terms.length > 0 || record.keywords.author_terms.length > 0) {
+    lines.push(`KW  - ${[...record.keywords.author_terms, ...record.keywords.ieee_terms].join(", ")}`);
+  }
+  lines.push(`AN  - ${record.article_number ?? ""}`);
+  lines.push("ER  - ");
+  return lines.join("\r\n");
+}
+
+/**
+ * A citation bundle for one or more records: plain citation, BibTeX and RIS.
+ * Generated mechanically from IEEE metadata - nothing is looked up elsewhere.
+ */
+export function citationBundle(records: PaperRecord[], retrievedAt: string): string {
+  const lines: string[] = [
+    "# Citation bundle",
+    "",
+    "Source of the underlying metadata: **IEEE Xplore Metadata Search API**.",
+    `Retrieved: ${retrievedAt}`,
+    "",
+    "> The plain-text citation and the BibTeX entry are generated mechanically from the",
+    "> metadata IEEE returned - nothing is invented, and nothing is looked up elsewhere.",
+    "> IEEE-style author initials are a best-effort transformation (name order conventions",
+    "> differ by culture), so check author formatting before submitting. RIS is the format",
+    "> to import into Zotero / EndNote / Mendeley.",
+    "",
+  ];
+
+  records.forEach((record, index) => {
+    lines.push("---");
+    lines.push("");
+    lines.push(`## ${index + 1}. ${record.title ?? "(title not returned by IEEE)"}`);
+    lines.push("");
+    if (record.missing_fields.length > 0) {
+      lines.push(`> Missing from the IEEE record: ${record.missing_fields.join(", ")}.`);
+      lines.push("");
+    }
+    lines.push("**Plain citation**");
+    lines.push("");
+    lines.push("```");
+    lines.push(toIeeeCitation(record));
+    lines.push("```");
+    lines.push("");
+    lines.push("**BibTeX**");
+    lines.push("");
+    lines.push("```bibtex");
+    lines.push(toBibtex([record], {
+      queryId: `citation-${index + 1}`,
+      retrievedAt,
+      endpoint: record.retrieved_via,
+      query: {},
+    }).split("\n").filter((line) => !line.startsWith("%")).join("\n").trim());
+    lines.push("```");
+    lines.push("");
+    lines.push("**RIS**");
+    lines.push("");
+    lines.push("```ris");
+    lines.push(toRis(record));
+    lines.push("```");
+    lines.push("");
+  });
+
+  return lines.join("\n").trimEnd();
 }
 
 export function referencesToMarkdown(payload: ReferenceLookupPayload): string {
